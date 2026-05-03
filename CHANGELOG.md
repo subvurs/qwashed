@@ -352,5 +352,5 @@ Treat v0.1.x as evaluation-grade software for civil-society pilots.
   deferred to v0.2 if sslyze maintenance becomes a risk. (Open question Q1
   in build plan §17.)
 
-[Unreleased]: https://github.com/qwashed/qwashed/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/qwashed/qwashed/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Subvurs/qwashed/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Subvurs/qwashed/releases/tag/v0.1.0

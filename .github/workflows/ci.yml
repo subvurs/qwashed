@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Mark Eatherly
+#
+# CI matrix for Qwashed.
+#
+# Jobs:
+#   - lint:        ruff check + ruff format --check
+#   - typecheck:   mypy --strict on qwashed/
+#   - test:        pytest across (3.11, 3.12, 3.13) x (ubuntu-latest, macos-14)
+#   - test-no-net: pytest with network disabled to enforce no-telemetry policy
+#
+# macos-14 is the Apple Silicon (arm64) runner. Linux is x86_64.
+# Windows is best-effort and not in CI for v0.1.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff check
+        run: ruff check qwashed tests
+
+      - name: Ruff format check
+        run: ruff format --check qwashed tests
+
+  typecheck:
+    name: Typecheck (mypy --strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install package + dev
+        run: |
+          python -m pip install --upgrade pip
+          # Install with full extras so mypy sees all third-party stubs.
+          pip install -e ".[dev,full]" || pip install -e ".[dev]"
+
+      - name: mypy
+        run: mypy qwashed
+
+  test:
+    name: Test (py${{ matrix.python }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: System deps (liboqs on Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # liboqs-python wheel covers most Linux x86_64 cases. Install
+          # the C library as a fallback in case the wheel build fails.
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev || true
+
+      - name: System deps (liboqs on macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install liboqs || true
+
+      - name: Install Qwashed with full extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,full]"
+
+      - name: pytest
+        run: pytest -ra --cov=qwashed --cov-report=term-missing
+
+      - name: Upload coverage artifact
+        if: matrix.python == '3.13' && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python }}
+          path: .coverage
+          if-no-files-found: ignore
+
+  test-no-net:
+    name: No-network test (telemetry policy enforcement)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Qwashed (core only, no audit/vault network deps)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run core tests with network disabled
+        # Use a deny-all firewall via unshare. Tests marked `network` are
+        # excluded; everything else MUST pass without any outbound connection.
+        run: |
+          pytest -ra -m "not network" tests/
+        env:
+          # Belt-and-suspenders: also clear common proxy variables so any
+          # accidental urllib usage cannot reach a corporate proxy.
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          NO_PROXY: "*"

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Mark Eatherly
+#
+# Journalism / source-protection threat profile.
+#
+# Use this for newsroom intake servers, secure-drop endpoints, journalist
+# personal infrastructure that must protect source identity over decades.
+# Source-identification consequences are permanent and severe; this profile
+# treats classical-only and unknown crypto as critical findings.
+
+name: journalism
+description: >
+  Source-protection-grade profile. Assumes source identity must remain
+  secret for 50+ years and that state-level adversaries are recording
+  traffic at scale. Any classical or unknown algorithm is critical.
+
+category_weights:
+  classical: 1.00    # source protection demands maximum severity
+  hybrid_pq: 0.30    # operational risk only; algorithms themselves are sound
+  pq_only:   0.10    # PQ-only without classical fallback has interop risk
+  unknown:   1.00    # fail-closed: equally severe to classical
+
+archival_likelihood: 0.95   # state-level archival of journalist traffic assumed
+
+severity_thresholds:
+  info:     0.0
+  low:      0.10
+  moderate: 0.25
+  high:     0.50
+  critical: 0.75   # lower threshold: journalism profile escalates faster
+
+aggregation: max  # the weakest endpoint compromises every source

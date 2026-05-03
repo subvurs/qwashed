@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Example audit config for the legal threat profile (privilege protection).
+targets:
+  - host: mail.example-lawfirm.org
+    port: 443
+    label: mail-frontend
+  - host: cases.example-lawfirm.org
+    port: 443
+    label: case-portal

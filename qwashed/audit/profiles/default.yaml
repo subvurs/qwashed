@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Mark Eatherly
+#
+# Default Qwashed threat profile.
+#
+# Use this when you have no specific organizational risk model in mind.
+# Tuned for a generic small/medium organization with mixed traffic
+# sensitivity and average exposure to long-term archival adversaries.
+#
+# Override with --profile <name> on the CLI; custom profiles can be added
+# under qwashed/audit/profiles/ as additional YAML files.
+
+name: default
+description: >
+  General-purpose civil-society profile. Treats classical-only crypto as
+  a high-severity finding under the working assumption that adversaries
+  with access to bulk traffic in 2026 are archiving for later decryption,
+  but does not push every classical exposure to "critical".
+
+category_weights:
+  classical: 0.85    # high but not maxed (some non-sensitive traffic)
+  hybrid_pq: 0.20    # PQ leg present; remaining exposure is operational
+  pq_only:   0.05    # theoretical only; pure-PQ deployments are rare
+  unknown:   0.85    # fail-closed: same weight as classical
+
+archival_likelihood: 0.65   # 2026 baseline: state-level archival assumed common
+
+severity_thresholds:
+  info:     0.0
+  low:      0.20
+  moderate: 0.45
+  high:     0.65
+  critical: 0.85
+
+aggregation: max  # the weakest target sets organizational severity

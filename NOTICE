@@ -1,0 +1,25 @@
+Qwashed
+Copyright 2026 Mark Eatherly
+
+This product includes software developed by Mark Eatherly.
+
+Qwashed is free post-quantum hygiene tooling for civil society:
+an HNDL (Harvest-Now-Decrypt-Later) audit tool and a hybrid
+post-quantum vault for evidence preservation and source protection.
+
+Licensed under the Apache License, Version 2.0 (the "License").
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+The name "Qwashed" is a trademark of Mark Eatherly. The Apache 2.0
+license grants you broad rights to use, modify, and redistribute
+this software, but does not grant you the right to use the "Qwashed"
+trademark for derivative works that meaningfully alter the security
+posture, add telemetry, or otherwise change the no-cost, no-tracking,
+civil-society-first character of this tool. See section 6 of the
+License regarding trademarks.
+
+This product depends on third-party libraries distributed under
+their own licenses. See the dependency manifest (pyproject.toml)
+and individual package metadata for those terms.

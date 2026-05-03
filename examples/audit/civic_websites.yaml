@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Example audit config for the default civil-society threat profile.
+# Replace these hostnames with your own targets before running for real.
+targets:
+  - host: civic.example.org
+    port: 443
+    label: main-site
+  - host: members.example.org
+    port: 443
+    label: members-portal

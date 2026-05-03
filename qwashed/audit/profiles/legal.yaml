@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Mark Eatherly
+#
+# Legal / advocacy threat profile.
+#
+# Use this for legal-aid organizations, civil-rights advocacy groups,
+# refugee/asylum legal services, and anyone whose client communications
+# are protected by attorney-client privilege but transit hostile networks.
+
+name: legal
+description: >
+  Attorney-client-privileged-communications profile. Assumes client
+  communications must remain confidential for the lifetime of the client
+  and possibly beyond. Stricter than healthcare; on par with journalism
+  for classical exposure.
+
+category_weights:
+  classical: 1.00    # attorney-client privilege demands maximum severity
+  hybrid_pq: 0.25
+  pq_only:   0.10
+  unknown:   1.00
+
+archival_likelihood: 0.90   # state-level interest in legal-aid orgs is high
+
+severity_thresholds:
+  info:     0.0
+  low:      0.12
+  moderate: 0.30
+  high:     0.55
+  critical: 0.78
+
+aggregation: max

@@ -1,0 +1,17 @@
+# Qwashed v0.1.0 release-signing public key
+#
+# Format: <key-id> <base64(raw 32-byte Ed25519 public key)>
+# Verify: python -c "from qwashed.core.signing import VerifyKey; \
+#                    VerifyKey.from_b64('<b64>').verify(message, signature)"
+#
+# Fingerprint (first 16 hex of sha256 of raw 32-byte public key):
+#   63ca4ae93b906a13
+#
+# Generated: 2026-05-01 (release prep for v0.1.0)
+# Secret key: stored offline at ~/.qwashed-release/qwashed-release.sk (mode 0600)
+#
+# This key signs SHA256SUMS and per-artifact .sha256 files for v0.1.0.
+# Cross-reference this fingerprint with docs/SECURITY.md and the GitHub
+# release-page key advertisement before trusting any artifact.
+
+qwashed-release-key-v1 D3SFIqPONbz0m/4jp75V1E5YlAkwNrHSIaC9GkYvghU=

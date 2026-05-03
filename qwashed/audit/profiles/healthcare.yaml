@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Mark Eatherly
+#
+# Healthcare / patient-data threat profile.
+#
+# Use this for clinics, NGO field hospitals, telemedicine platforms that
+# transmit patient identifiers, diagnoses, and treatment records. Patient
+# data has decades-long sensitivity (HIV status, mental health, reproductive
+# health) and breach consequences are personal and irreversible.
+
+name: healthcare
+description: >
+  Patient-data profile. Calibrated to long-lived medical records (50-year
+  sensitivity for many categories) and to organizations operating under
+  HIPAA/GDPR-equivalent regimes. Stricter than default but not as severe
+  as journalism's source-protection model.
+
+category_weights:
+  classical: 0.95    # very high; patient data must not be archived in classical
+  hybrid_pq: 0.25    # acceptable but not the v1 endgame
+  pq_only:   0.08
+  unknown:   0.95    # fail-closed: treat as classical
+
+archival_likelihood: 0.80   # state and commercial archival both plausible
+
+severity_thresholds:
+  info:     0.0
+  low:      0.15
+  moderate: 0.35
+  high:     0.55
+  critical: 0.80
+
+aggregation: max

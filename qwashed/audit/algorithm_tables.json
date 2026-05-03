@@ -1,0 +1,136 @@
+{
+  "_meta": {
+    "version": 1,
+    "spdx_license": "Apache-2.0",
+    "copyright": "2026 Mark Eatherly",
+    "description": "Wire-name -> category lookup for the Qwashed HNDL classifier. Categories are: classical (HNDL-vulnerable), hybrid_pq (classical || PQ co-installed), pq_only (post-quantum primitive only), unknown (treated as worst-case classical for fail-closed scoring). When updating: keep entries lowercase except where the protocol RFC or IANA registry uses a specific case (e.g. cipher suite identifiers are upper snake case). Unknown entries are NOT listed; the classifier treats anything missing from this table as 'unknown'."
+  },
+  "tls_key_exchange_groups": {
+    "classical": [
+      "secp256r1",
+      "secp384r1",
+      "secp521r1",
+      "x25519",
+      "x448",
+      "ffdhe2048",
+      "ffdhe3072",
+      "ffdhe4096",
+      "ffdhe6144",
+      "ffdhe8192"
+    ],
+    "hybrid_pq": [
+      "x25519mlkem768",
+      "x25519kyber768",
+      "secp256r1mlkem768",
+      "secp384r1mlkem1024",
+      "p384_kyber768",
+      "p256_kyber512"
+    ],
+    "pq_only": [
+      "mlkem512",
+      "mlkem768",
+      "mlkem1024",
+      "kyber512",
+      "kyber768",
+      "kyber1024"
+    ]
+  },
+  "tls_signature_algorithms": {
+    "classical": [
+      "rsa_pkcs1_sha256",
+      "rsa_pkcs1_sha384",
+      "rsa_pkcs1_sha512",
+      "rsa_pss_rsae_sha256",
+      "rsa_pss_rsae_sha384",
+      "rsa_pss_rsae_sha512",
+      "rsa_pss_pss_sha256",
+      "rsa_pss_pss_sha384",
+      "rsa_pss_pss_sha512",
+      "ecdsa_secp256r1_sha256",
+      "ecdsa_secp384r1_sha384",
+      "ecdsa_secp521r1_sha512",
+      "ed25519",
+      "ed448"
+    ],
+    "hybrid_pq": [
+      "ed25519_mldsa44",
+      "ed25519_mldsa65",
+      "ecdsa_p256_mldsa65",
+      "rsa_pss_mldsa65",
+      "mldsa65_with_ed25519"
+    ],
+    "pq_only": [
+      "mldsa44",
+      "mldsa65",
+      "mldsa87",
+      "slhdsa_sha2_128s",
+      "slhdsa_sha2_192s",
+      "slhdsa_sha2_256s",
+      "falcon_512",
+      "falcon_1024"
+    ]
+  },
+  "tls_cipher_suites": {
+    "classical": [
+      "TLS_AES_128_GCM_SHA256",
+      "TLS_AES_256_GCM_SHA384",
+      "TLS_CHACHA20_POLY1305_SHA256",
+      "TLS_AES_128_CCM_SHA256",
+      "TLS_AES_128_CCM_8_SHA256",
+      "TLS_RSA_WITH_AES_128_GCM_SHA256",
+      "TLS_RSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+    ]
+  },
+  "ssh_key_exchange": {
+    "classical": [
+      "diffie-hellman-group14-sha1",
+      "diffie-hellman-group14-sha256",
+      "diffie-hellman-group16-sha512",
+      "diffie-hellman-group18-sha512",
+      "diffie-hellman-group-exchange-sha256",
+      "ecdh-sha2-nistp256",
+      "ecdh-sha2-nistp384",
+      "ecdh-sha2-nistp521",
+      "curve25519-sha256",
+      "curve25519-sha256@libssh.org"
+    ],
+    "hybrid_pq": [
+      "sntrup761x25519-sha512",
+      "sntrup761x25519-sha512@openssh.com",
+      "mlkem768x25519-sha256",
+      "mlkem768nistp256-sha256",
+      "mlkem1024nistp384-sha384"
+    ],
+    "pq_only": [
+      "sntrup761-sha512",
+      "mlkem768-sha256",
+      "mlkem1024-sha384"
+    ]
+  },
+  "ssh_host_key_algorithms": {
+    "classical": [
+      "ssh-rsa",
+      "rsa-sha2-256",
+      "rsa-sha2-512",
+      "ecdsa-sha2-nistp256",
+      "ecdsa-sha2-nistp384",
+      "ecdsa-sha2-nistp521",
+      "ssh-ed25519",
+      "ssh-ed25519-cert-v01@openssh.com"
+    ],
+    "hybrid_pq": [
+      "ssh-ed25519-mldsa65",
+      "ed25519-mldsa65@openssh.com"
+    ],
+    "pq_only": [
+      "ssh-mldsa65",
+      "ssh-mldsa87"
+    ]
+  }
+}

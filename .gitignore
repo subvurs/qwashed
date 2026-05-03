@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ---------------------------------------------------------------------------
+# Testing / linting / typing
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Qwashed-specific (operational secrets and user data — must NEVER be checked in)
+# ---------------------------------------------------------------------------
+
+# Vault directories: any path that looks like a Qwashed vault root. We err on
+# the side of caution; user-created vaults live outside the repo by default.
+*.qwashed-vault/
+qwashed-vault/
+.qwashed/
+
+# Signing keys
+*.ed25519.sk
+*.mldsa65.sk
+*.hybrid.sk
+qwashed-signing-key
+qwashed-signing-key.*
+
+# Signed audit artifacts that contain real organizational data
+audit-*.json
+audit-*.html
+audit-*.pdf
+!examples/audit_demo_*.json
+!tests/**/audit-fixture-*.json
+
+# Raw TLS handshakes captured during probing (may contain certificates)
+*.handshake.b64
+
+# Local override of threat profiles (users may keep private profiles)
+local_profiles/

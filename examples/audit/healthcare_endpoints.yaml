@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Example audit config for the healthcare threat profile.
+# HIPAA-style postures often require a stricter migration roadmap;
+# the healthcare profile reflects this.
+targets:
+  - host: ehr.example-clinic.org
+    port: 443
+    label: ehr-frontend
+  - host: portal.example-clinic.org
+    port: 443
+    label: patient-portal

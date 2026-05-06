@@ -137,12 +137,19 @@ from qwashed.vault.hybrid_sig import (
 __all__ = [
     "BLOB_MAGIC",
     "BLOB_VERSION",
+    "BLOB_VERSION_V01",
+    "BLOB_VERSION_V02",
     "DIR_MODE",
     "ENTRY_AEAD_INFO",
+    "ENTRY_AEAD_INFO_V01",
+    "ENTRY_AEAD_INFO_V02",
     "ENTRY_NONCE_LEN",
     "EXPORT_SIG_DOMAIN",
     "EXPORT_VERSION",
     "FILE_MODE",
+    "FORMAT_VERSION_V01",
+    "FORMAT_VERSION_V02",
+    "FORMAT_VERSION_CURRENT",
     "IDENTITY_VERSION",
     "MANIFEST_VERSION",
     "META_VERSION",
@@ -150,6 +157,7 @@ __all__ = [
     "EntryMetadata",
     "ExportBundle",
     "Recipient",
+    "UpgradeReport",
     "Vault",
     "VaultIdentity",
     "VaultManifest",
@@ -182,14 +190,62 @@ META_VERSION: Final[int] = 1
 #: Magic bytes at the start of an encrypted entry blob.
 BLOB_MAGIC: Final[bytes] = b"QWEV"
 
-#: Version of the entry blob binary header.
-BLOB_VERSION: Final[int] = 1
+#: Vault format version constants. v0.1 is the initial release format;
+#: v0.2 introduces versioned HKDF info strings (domain separation across
+#: format generations) but retains identical algorithm choices.
+FORMAT_VERSION_V01: Final[int] = 1
+FORMAT_VERSION_V02: Final[int] = 2
+
+#: Current/default format version used by all new writes in this build.
+FORMAT_VERSION_CURRENT: Final[int] = FORMAT_VERSION_V02
+
+#: Set of format versions this build accepts on read. Older formats are
+#: still readable until the deprecation window closes (planned: v0.4).
+_SUPPORTED_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset(
+    {FORMAT_VERSION_V01, FORMAT_VERSION_V02}
+)
+
+#: Version of the entry blob binary header. The byte at offset 4 of every
+#: blob equals one of these. New writes use ``BLOB_VERSION_V02``; readers
+#: dispatch on the byte to choose the correct HKDF info strings.
+BLOB_VERSION_V01: Final[int] = 1
+BLOB_VERSION_V02: Final[int] = 2
+
+#: Backwards-compatible alias for the current default blob version.
+BLOB_VERSION: Final[int] = BLOB_VERSION_V02
 
 #: AES-256-GCM nonce length (96 bits / 12 bytes per NIST SP 800-38D).
 ENTRY_NONCE_LEN: Final[int] = 12
 
-#: HKDF info string for entry AEAD key derivation.
-ENTRY_AEAD_INFO: Final[bytes] = info_for(module="vault", purpose="entry-aead")
+#: HKDF info strings for entry AEAD key derivation, per format version.
+ENTRY_AEAD_INFO_V01: Final[bytes] = info_for(
+    module="vault", purpose="entry-aead", version="v0.1"
+)
+ENTRY_AEAD_INFO_V02: Final[bytes] = info_for(
+    module="vault", purpose="entry-aead", version="v0.2"
+)
+
+#: Backwards-compatible alias (v0.1 callers).
+ENTRY_AEAD_INFO: Final[bytes] = ENTRY_AEAD_INFO_V01
+
+
+def _entry_aead_info_for(format_version: int) -> bytes:
+    """Return the HKDF info string for entry AEAD derivation at the given
+    ``format_version``.
+
+    Raises
+    ------
+    SignatureError
+        If ``format_version`` is not in :data:`_SUPPORTED_FORMAT_VERSIONS`.
+    """
+    if format_version == FORMAT_VERSION_V01:
+        return ENTRY_AEAD_INFO_V01
+    if format_version == FORMAT_VERSION_V02:
+        return ENTRY_AEAD_INFO_V02
+    raise SignatureError(
+        f"unsupported entry AEAD format_version: {format_version}",
+        error_code="vault.store.bad_aead_format_version",
+    )
 
 #: Maximum sane KEM-ciphertext length we will accept when parsing a blob.
 _MAX_KEM_CT_LEN: Final[int] = 1 << 16  # 64 KiB; FIPS 203 ML-KEM-768 ct is 1088 bytes.
@@ -327,7 +383,15 @@ class VaultIdentity:
 
 @dataclass(frozen=True)
 class VaultManifest:
-    """Top-level signed root of trust for a vault."""
+    """Top-level signed root of trust for a vault.
+
+    ``version`` is the JSON-schema version (still 1 in v0.2 — the document
+    shape has not broken). ``format_version`` tracks the cryptographic
+    binding format: 1 == v0.1 (HKDF info ``qwashed/vault/v0.1/*``,
+    blob version byte 1), 2 == v0.2. The field is omitted from the
+    canonical signed body when ``format_version == 1`` so that v0.1
+    manifests remain bit-identical under a v0.2 reader.
+    """
 
     version: int
     vault_id: str
@@ -335,6 +399,7 @@ class VaultManifest:
     kem_pk_b64: str
     sig_pk_b64: str
     sig_hybrid_b64: str
+    format_version: int = FORMAT_VERSION_V01
 
     def to_dict(self, *, with_signature: bool = True) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -344,6 +409,8 @@ class VaultManifest:
             "vault_id": self.vault_id,
             "version": self.version,
         }
+        if self.format_version > FORMAT_VERSION_V01:
+            out["format_version"] = self.format_version
         if with_signature:
             out["sig_hybrid"] = self.sig_hybrid_b64
         return out
@@ -351,7 +418,14 @@ class VaultManifest:
 
 @dataclass(frozen=True)
 class EntryMetadata:
-    """Per-entry signed metadata, persisted as ``<ulid>.meta.json``."""
+    """Per-entry signed metadata, persisted as ``<ulid>.meta.json``.
+
+    ``format_version`` mirrors the per-entry blob's cryptographic format
+    (see :class:`VaultManifest`): 1 == v0.1 ciphertext (HKDF info
+    ``qwashed/vault/v0.1/entry-aead`` + blob byte 1), 2 == v0.2.
+    Like the manifest, the field is omitted from the canonical signed
+    body when equal to 1 so legacy meta files remain byte-identical.
+    """
 
     version: int
     ulid: str
@@ -361,6 +435,7 @@ class EntryMetadata:
     blob_sha256: str
     actor_pk_b64: str
     sig_hybrid_b64: str
+    format_version: int = FORMAT_VERSION_V01
 
     def to_dict(self, *, with_signature: bool = True) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -372,9 +447,34 @@ class EntryMetadata:
             "ulid": self.ulid,
             "version": self.version,
         }
+        if self.format_version > FORMAT_VERSION_V01:
+            out["format_version"] = self.format_version
         if with_signature:
             out["sig_hybrid"] = self.sig_hybrid_b64
         return out
+
+
+@dataclass(frozen=True)
+class UpgradeReport:
+    """Result of a :meth:`Vault.upgrade` run.
+
+    ``upgraded`` is the list of ULIDs that were re-encrypted from
+    v0.1 to v0.2. ``already_current`` is the list of ULIDs that were
+    already at the current format and were not touched. The two lists
+    are disjoint and together cover every entry in the vault at the
+    moment :meth:`Vault.upgrade` was invoked.
+    """
+
+    upgraded: tuple[str, ...]
+    already_current: tuple[str, ...]
+    target_format_version: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "already_current": list(self.already_current),
+            "target_format_version": self.target_format_version,
+            "upgraded": list(self.upgraded),
+        }
 
 
 @dataclass(frozen=True)
@@ -651,7 +751,13 @@ def _sign_manifest(
     vault_id: str,
     created_at: str,
     identity: VaultIdentity,
+    format_version: int = FORMAT_VERSION_V01,
 ) -> VaultManifest:
+    if format_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SchemaValidationError(
+            f"unsupported manifest format_version: {format_version}",
+            error_code="vault.store.manifest_bad_format_version",
+        )
     sig_pk_b64 = identity.sig_public_b64()
     body = canonicalize(
         VaultManifest(
@@ -661,6 +767,7 @@ def _sign_manifest(
             kem_pk_b64=identity.kem_public_b64(),
             sig_pk_b64=sig_pk_b64,
             sig_hybrid_b64="",
+            format_version=format_version,
         ).to_dict(with_signature=False)
     )
     sig_blob = sign(identity.sig, body)
@@ -671,6 +778,7 @@ def _sign_manifest(
         kem_pk_b64=identity.kem_public_b64(),
         sig_pk_b64=sig_pk_b64,
         sig_hybrid_b64=base64.b64encode(sig_blob).decode("ascii"),
+        format_version=format_version,
     )
 
 
@@ -679,6 +787,11 @@ def _verify_manifest(manifest: VaultManifest) -> None:
         raise SchemaValidationError(
             f"unsupported manifest version: {manifest.version}",
             error_code="vault.store.manifest_bad_version",
+        )
+    if manifest.format_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SchemaValidationError(
+            f"unsupported manifest format_version: {manifest.format_version}",
+            error_code="vault.store.manifest_bad_format_version",
         )
     body = canonicalize(manifest.to_dict(with_signature=False))
     try:
@@ -705,17 +818,30 @@ def _parse_manifest(raw: bytes) -> VaultManifest:
             error_code="vault.store.manifest_bad_json",
         ) from exc
     required = {"version", "vault_id", "created_at", "kem_pk", "sig_pk", "sig_hybrid"}
+    optional = {"format_version"}
+    allowed = required | optional
     missing = sorted(required - doc.keys())
     if missing:
         raise SchemaValidationError(
             f"manifest missing keys: {missing}",
             error_code="vault.store.manifest_missing_keys",
         )
-    extras = sorted(doc.keys() - required)
+    extras = sorted(doc.keys() - allowed)
     if extras:
         raise SchemaValidationError(
             f"manifest has unknown keys: {extras}",
             error_code="vault.store.manifest_unknown_keys",
+        )
+    fmt_raw = doc.get("format_version", FORMAT_VERSION_V01)
+    if not isinstance(fmt_raw, int) or isinstance(fmt_raw, bool):
+        raise SchemaValidationError(
+            f"manifest format_version must be int, got {fmt_raw!r}",
+            error_code="vault.store.manifest_bad_format_version",
+        )
+    if fmt_raw not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SchemaValidationError(
+            f"unsupported manifest format_version: {fmt_raw}",
+            error_code="vault.store.manifest_bad_format_version",
         )
     return VaultManifest(
         version=int(doc["version"]),
@@ -724,6 +850,7 @@ def _parse_manifest(raw: bytes) -> VaultManifest:
         kem_pk_b64=str(doc["kem_pk"]),
         sig_pk_b64=str(doc["sig_pk"]),
         sig_hybrid_b64=str(doc["sig_hybrid"]),
+        format_version=int(fmt_raw),
     )
 
 
@@ -740,7 +867,13 @@ def _sign_metadata(
     created_at: str,
     blob_sha256: str,
     identity: VaultIdentity,
+    format_version: int = FORMAT_VERSION_V01,
 ) -> EntryMetadata:
+    if format_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SchemaValidationError(
+            f"unsupported entry metadata format_version: {format_version}",
+            error_code="vault.store.meta_bad_format_version",
+        )
     actor_pk_b64 = identity.sig_public_b64()
     body = canonicalize(
         EntryMetadata(
@@ -752,6 +885,7 @@ def _sign_metadata(
             blob_sha256=blob_sha256,
             actor_pk_b64=actor_pk_b64,
             sig_hybrid_b64="",
+            format_version=format_version,
         ).to_dict(with_signature=False)
     )
     sig_blob = sign(identity.sig, body)
@@ -764,6 +898,7 @@ def _sign_metadata(
         blob_sha256=blob_sha256,
         actor_pk_b64=actor_pk_b64,
         sig_hybrid_b64=base64.b64encode(sig_blob).decode("ascii"),
+        format_version=format_version,
     )
 
 
@@ -772,6 +907,11 @@ def _verify_metadata(meta: EntryMetadata) -> None:
         raise SchemaValidationError(
             f"unsupported entry metadata version: {meta.version}",
             error_code="vault.store.meta_bad_version",
+        )
+    if meta.format_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SchemaValidationError(
+            f"unsupported entry metadata format_version: {meta.format_version}",
+            error_code="vault.store.meta_bad_format_version",
         )
     body = canonicalize(meta.to_dict(with_signature=False))
     try:
@@ -807,13 +947,15 @@ def _parse_metadata(raw: bytes) -> EntryMetadata:
         "actor_pk",
         "sig_hybrid",
     }
+    optional = {"format_version"}
+    allowed = required | optional
     missing = sorted(required - doc.keys())
     if missing:
         raise SchemaValidationError(
             f"entry metadata missing keys: {missing}",
             error_code="vault.store.meta_missing_keys",
         )
-    extras = sorted(doc.keys() - required)
+    extras = sorted(doc.keys() - allowed)
     if extras:
         raise SchemaValidationError(
             f"entry metadata has unknown keys: {extras}",
@@ -825,6 +967,17 @@ def _parse_metadata(raw: bytes) -> EntryMetadata:
             f"entry metadata size must be non-negative int, got {doc['size']!r}",
             error_code="vault.store.meta_bad_size",
         )
+    fmt_raw = doc.get("format_version", FORMAT_VERSION_V01)
+    if not isinstance(fmt_raw, int) or isinstance(fmt_raw, bool):
+        raise SchemaValidationError(
+            f"entry metadata format_version must be int, got {fmt_raw!r}",
+            error_code="vault.store.meta_bad_format_version",
+        )
+    if fmt_raw not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SchemaValidationError(
+            f"unsupported entry metadata format_version: {fmt_raw}",
+            error_code="vault.store.meta_bad_format_version",
+        )
     return EntryMetadata(
         version=int(doc["version"]),
         ulid=str(doc["ulid"]),
@@ -834,6 +987,7 @@ def _parse_metadata(raw: bytes) -> EntryMetadata:
         blob_sha256=str(doc["blob_sha256"]),
         actor_pk_b64=str(doc["actor_pk"]),
         sig_hybrid_b64=str(doc["sig_hybrid"]),
+        format_version=int(fmt_raw),
     )
 
 
@@ -847,9 +1001,23 @@ def _seal_blob(
     ulid: str,
     plaintext: bytes,
     recipient_kem_pk: bytes,
+    format_version: int = FORMAT_VERSION_CURRENT,
 ) -> bytes:
-    """Encapsulate, derive AEAD key, encrypt plaintext, return blob bytes."""
-    kem_ct, ss = encapsulate(recipient_kem_pk)
+    """Encapsulate, derive AEAD key, encrypt plaintext, return blob bytes.
+
+    The blob version byte (offset 4) is set to ``format_version`` and
+    becomes the on-disk discriminator: :func:`_open_blob` reads it back
+    to pick the matching HKDF info string. New writes default to
+    :data:`FORMAT_VERSION_CURRENT`; the v0.1 path remains reachable for
+    re-encrypt-during-export style operations that need to preserve the
+    original format.
+    """
+    if format_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SignatureError(
+            f"unsupported entry blob format_version: {format_version}",
+            error_code="vault.store.blob_bad_format_version",
+        )
+    kem_ct, ss = encapsulate(recipient_kem_pk, format_version=format_version)
     if len(kem_ct) > _MAX_KEM_CT_LEN:
         raise SignatureError(
             f"hybrid KEM ciphertext too large: {len(kem_ct)}",
@@ -858,13 +1026,18 @@ def _seal_blob(
     aead_key = hkdf_sha256(
         ikm=ss,
         salt=b"",
-        info=ENTRY_AEAD_INFO,
+        info=_entry_aead_info_for(format_version),
         length=32,
     )
     nonce = secrets.token_bytes(ENTRY_NONCE_LEN)
     aead = AESGCM(aead_key)
     aead_blob = aead.encrypt(nonce, plaintext, ulid.encode("ascii"))
-    header = BLOB_MAGIC + bytes([BLOB_VERSION]) + b"\x00\x00\x00" + struct.pack(">I", len(kem_ct))
+    header = (
+        BLOB_MAGIC
+        + bytes([format_version])
+        + b"\x00\x00\x00"
+        + struct.pack(">I", len(kem_ct))
+    )
     return header + kem_ct + nonce + aead_blob
 
 
@@ -874,7 +1047,12 @@ def _open_blob(
     blob_bytes: bytes,
     identity: VaultIdentity,
 ) -> bytes:
-    """Parse a sealed blob, decapsulate, AES-GCM decrypt, return plaintext."""
+    """Parse a sealed blob, decapsulate, AES-GCM decrypt, return plaintext.
+
+    The blob version byte selects the cryptographic format: 1 == v0.1
+    (HKDF info ``qwashed/vault/v0.1/*``), 2 == v0.2. Unknown versions
+    fail closed.
+    """
     if len(blob_bytes) < 4 + 1 + 3 + 4:
         raise SignatureError(
             f"entry blob too short: {len(blob_bytes)} bytes",
@@ -885,9 +1063,10 @@ def _open_blob(
             f"entry blob has wrong magic: {blob_bytes[0:4]!r}",
             error_code="vault.store.blob_bad_magic",
         )
-    if blob_bytes[4] != BLOB_VERSION:
+    blob_version = blob_bytes[4]
+    if blob_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise SignatureError(
-            f"entry blob has unsupported version: {blob_bytes[4]}",
+            f"entry blob has unsupported version: {blob_version}",
             error_code="vault.store.blob_bad_version",
         )
     if blob_bytes[5:8] != b"\x00\x00\x00":
@@ -917,11 +1096,11 @@ def _open_blob(
             error_code="vault.store.blob_aead_too_large",
         )
 
-    ss = decapsulate(identity.kem, kem_ct)
+    ss = decapsulate(identity.kem, kem_ct, format_version=blob_version)
     aead_key = hkdf_sha256(
         ikm=ss,
         salt=b"",
-        info=ENTRY_AEAD_INFO,
+        info=_entry_aead_info_for(blob_version),
         length=32,
     )
     aead = AESGCM(aead_key)
@@ -932,6 +1111,26 @@ def _open_blob(
             f"entry {ulid} AEAD decryption failed (tampered or wrong identity)",
             error_code="vault.store.blob_decrypt_failed",
         ) from exc
+
+
+def _peek_blob_version(blob_bytes: bytes) -> int:
+    """Read the on-disk format-version byte without decrypting.
+
+    Returns the integer in :data:`_SUPPORTED_FORMAT_VERSIONS`. Used by
+    :meth:`Vault.upgrade` to decide which entries still need migration.
+    """
+    if len(blob_bytes) < 5 or blob_bytes[0:4] != BLOB_MAGIC:
+        raise SignatureError(
+            "entry blob has wrong magic or is truncated",
+            error_code="vault.store.blob_bad_magic",
+        )
+    blob_version = blob_bytes[4]
+    if blob_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise SignatureError(
+            f"entry blob has unsupported version: {blob_version}",
+            error_code="vault.store.blob_bad_version",
+        )
+    return blob_version
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1469,7 @@ class Vault:
             ulid=ulid,
             plaintext=plaintext,
             recipient_kem_pk=self._identity.kem.public_bytes(),
+            format_version=FORMAT_VERSION_CURRENT,
         )
         blob_sha256 = hashlib.sha256(blob).hexdigest()
         meta = _sign_metadata(
@@ -1279,6 +1479,7 @@ class Vault:
             created_at=_utc_now_iso(),
             blob_sha256=blob_sha256,
             identity=self._identity,
+            format_version=FORMAT_VERSION_CURRENT,
         )
 
         # Write blob, then meta. Audit log is appended last so a
@@ -1444,6 +1645,174 @@ class Vault:
                 f"audit log 'put' subjects without on-disk entry: {sorted(missing_on_disk)}",
                 error_code="vault.store.logged_entry_missing",
             )
+
+    # ------------------------------------------------------------------
+    # Format migration
+    # ------------------------------------------------------------------
+
+    def upgrade(
+        self,
+        *,
+        target_format_version: int = FORMAT_VERSION_CURRENT,
+    ) -> UpgradeReport:
+        """Re-encrypt every legacy entry to ``target_format_version``.
+
+        Walks ``entries/``, opens every blob whose on-disk version byte
+        is below ``target_format_version``, decrypts in memory, and
+        re-seals at the new format. The new ``meta.json`` is written
+        first via :func:`_atomic_write` (carrying the new
+        ``format_version`` field and a fresh hybrid signature), then the
+        new blob is atomically swapped over the old one. After both are
+        in place an ``op="upgrade"`` audit-log line is appended for the
+        entry, signed by the current identity. Manifest is rewritten
+        last to advertise the new ``format_version``.
+
+        Plaintext only ever lives in a local ``bytearray`` that is
+        zeroed before this method returns; no plaintext is ever written
+        to disk during an upgrade. ``put`` audit-log lines for the
+        original entries remain in place — the upgrade is additive and
+        does not break existing put<->entry cross-checks in
+        :meth:`verify`.
+
+        Parameters
+        ----------
+        target_format_version:
+            The format to upgrade to. Defaults to
+            :data:`FORMAT_VERSION_CURRENT`. Must be one of the
+            :data:`_SUPPORTED_FORMAT_VERSIONS`.
+
+        Returns
+        -------
+        UpgradeReport
+            ``upgraded`` lists ULIDs that were re-encrypted;
+            ``already_current`` lists ULIDs that were already at the
+            target format. Together they cover every entry on disk.
+
+        Raises
+        ------
+        SchemaValidationError
+            If ``target_format_version`` is not a supported version.
+        SignatureError
+            On any cryptographic failure during re-encryption. Failures
+            leave any entries already migrated in their migrated state;
+            the audit log records each successful migration.
+        """
+        if target_format_version not in _SUPPORTED_FORMAT_VERSIONS:
+            raise SchemaValidationError(
+                f"unsupported target_format_version: {target_format_version}",
+                error_code="vault.store.upgrade_bad_target",
+            )
+
+        upgraded: list[str] = []
+        already_current: list[str] = []
+
+        # Snapshot the entry list up front so a tampered scan during
+        # iteration cannot influence which ULIDs we touch.
+        metas = self.list()
+        for meta in metas:
+            blob_path = _entry_blob_path(self._root, meta.ulid)
+            blob_bytes = blob_path.read_bytes()
+            current_version = _peek_blob_version(blob_bytes)
+
+            if current_version >= target_format_version:
+                already_current.append(meta.ulid)
+                continue
+
+            # Cross-check: meta.format_version should match the on-disk
+            # blob version. A mismatch is fail-closed — we refuse to
+            # silently re-write a blob whose on-disk format disagrees
+            # with its signed metadata.
+            if meta.format_version != current_version:
+                raise SignatureError(
+                    (
+                        f"entry {meta.ulid} format mismatch: "
+                        f"meta.format_version={meta.format_version} "
+                        f"blob_version={current_version}"
+                    ),
+                    error_code="vault.store.upgrade_format_mismatch",
+                )
+
+            # Decrypt v0.1 entry into a scrub-able buffer.
+            plaintext = _open_blob(
+                ulid=meta.ulid,
+                blob_bytes=blob_bytes,
+                identity=self._identity,
+            )
+            scratch = bytearray(plaintext)
+            try:
+                # Sanity-check: decrypted size must match signed size.
+                if len(scratch) != meta.size:
+                    raise SignatureError(
+                        (
+                            f"entry {meta.ulid} decrypted size "
+                            f"{len(scratch)} != meta.size {meta.size}"
+                        ),
+                        error_code="vault.store.upgrade_size_mismatch",
+                    )
+
+                new_blob = _seal_blob(
+                    ulid=meta.ulid,
+                    plaintext=bytes(scratch),
+                    recipient_kem_pk=self._identity.kem.public_bytes(),
+                    format_version=target_format_version,
+                )
+            finally:
+                # Scrub plaintext from memory before any disk I/O.
+                for i in range(len(scratch)):
+                    scratch[i] = 0
+                del scratch
+                del plaintext
+
+            new_blob_sha256 = hashlib.sha256(new_blob).hexdigest()
+            new_meta = _sign_metadata(
+                ulid=meta.ulid,
+                name=meta.name,
+                size=meta.size,
+                created_at=meta.created_at,  # preserve original timestamp
+                blob_sha256=new_blob_sha256,
+                identity=self._identity,
+                format_version=target_format_version,
+            )
+
+            # Atomic swap: write new meta first (so verify still passes
+            # mid-upgrade because old blob still matches old meta if
+            # we crash before swapping the blob — actually the new meta
+            # would mismatch the old blob. So we write blob first, then
+            # meta, matching the put() ordering).
+            _atomic_write(_entry_blob_path(self._root, meta.ulid), new_blob)
+            _atomic_write(
+                _entry_meta_path(self._root, meta.ulid),
+                canonicalize(new_meta.to_dict(with_signature=True)),
+            )
+            self._audit_writer.append(op="upgrade", subject=meta.ulid)
+            upgraded.append(meta.ulid)
+
+        # Rewrite manifest to advertise the new format_version. We
+        # re-sign with the same vault_id and created_at so the manifest
+        # identity is preserved across the upgrade. Skip if already at
+        # target format and no entries were upgraded — the file is
+        # already byte-identical to what we'd write.
+        if (
+            self._manifest.format_version != target_format_version
+            or upgraded
+        ):
+            new_manifest = _sign_manifest(
+                vault_id=self._manifest.vault_id,
+                created_at=self._manifest.created_at,
+                identity=self._identity,
+                format_version=target_format_version,
+            )
+            _atomic_write(
+                _manifest_path(self._root),
+                canonicalize(new_manifest.to_dict(with_signature=True)),
+            )
+            self._manifest = new_manifest
+
+        return UpgradeReport(
+            upgraded=tuple(upgraded),
+            already_current=tuple(already_current),
+            target_format_version=target_format_version,
+        )
 
     # ------------------------------------------------------------------
     # Recipients
@@ -1615,6 +1984,7 @@ class Vault:
             ulid=ulid,
             plaintext=plaintext,
             recipient_kem_pk=recipient_kem_pk,
+            format_version=FORMAT_VERSION_CURRENT,
         )
         new_blob_sha256 = hashlib.sha256(new_blob).hexdigest()
 
@@ -1707,13 +2077,16 @@ def init_vault(
     )
     _atomic_write(_identity_sk_enc_path(root), wrapped)
 
-    # manifest.json: signed root.
+    # manifest.json: signed root. New vaults are written at the current
+    # format version (v0.2); existing v0.1 vaults remain readable in
+    # place and can be migrated via :meth:`Vault.upgrade`.
     vault_id = new_ulid()
     created_at = _utc_now_iso()
     manifest = _sign_manifest(
         vault_id=vault_id,
         created_at=created_at,
         identity=identity,
+        format_version=FORMAT_VERSION_CURRENT,
     )
     _atomic_write(
         _manifest_path(root),

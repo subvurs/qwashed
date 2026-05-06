@@ -2,8 +2,8 @@
 # Copyright 2026 Mark Eatherly
 """Append-only, hash-chained, hybrid-signed audit log.
 
-Every vault-mutating operation (init, put, get, delete, export) writes a
-single line to the vault's ``audit_log.jsonl`` file. Each line is:
+Every vault-mutating operation (init, put, get, delete, export, upgrade)
+writes a single line to the vault's ``audit_log.jsonl`` file. Each line is:
 
 * a canonical JSON object,
 * hash-chained to the previous line via SHA3-256 of the canonicalized
@@ -65,7 +65,9 @@ __all__ = [
 ]
 
 #: All operations the vault may record.
-OPS: Final[frozenset[str]] = frozenset({"init", "put", "get", "delete", "export"})
+OPS: Final[frozenset[str]] = frozenset(
+    {"init", "put", "get", "delete", "export", "upgrade"}
+)
 
 #: Sentinel ``prev_hash`` for the genesis line.
 GENESIS_PREV_HASH: Final[str] = "0" * 64
@@ -86,7 +88,7 @@ class AuditLogEntry:
     """
 
     ts: str
-    op: Literal["init", "put", "get", "delete", "export"]
+    op: Literal["init", "put", "get", "delete", "export", "upgrade"]
     subject: str
     actor_pk_b64: str
     prev_hash: str
@@ -113,7 +115,7 @@ class AuditLogEntry:
 # ---------------------------------------------------------------------------
 
 
-def _validate_op(op: str) -> Literal["init", "put", "get", "delete", "export"]:
+def _validate_op(op: str) -> Literal["init", "put", "get", "delete", "export", "upgrade"]:
     if op not in OPS:
         raise SchemaValidationError(
             f"audit log op must be one of {sorted(OPS)}, got {op!r}",

@@ -69,6 +69,8 @@ from qwashed.core.kdf import hkdf_sha256, info_for
 
 __all__ = [
     "HYBRID_KEM_INFO",
+    "HYBRID_KEM_INFO_V01",
+    "HYBRID_KEM_INFO_V02",
     "HYBRID_KEM_SHARED_SECRET_LEN",
     "MLKEM768_CIPHERTEXT_LEN",
     "MLKEM768_PUBKEY_LEN",
@@ -79,6 +81,7 @@ __all__ = [
     "decapsulate",
     "encapsulate",
     "generate_keypair",
+    "kem_info_for_format",
     "parse_public_key",
     "serialize_public_key",
 ]
@@ -101,8 +104,37 @@ X25519_PUBKEY_LEN: Final[int] = 32
 #: Final hybrid shared-secret length (HKDF output).
 HYBRID_KEM_SHARED_SECRET_LEN: Final[int] = 32
 
-#: Canonical HKDF info string for the hybrid combiner.
-HYBRID_KEM_INFO: Final[bytes] = info_for(module="vault", purpose="kem")
+#: Canonical HKDF info string for the hybrid combiner -- vault format v0.1.
+HYBRID_KEM_INFO_V01: Final[bytes] = info_for(module="vault", purpose="kem", version="v0.1")
+
+#: Canonical HKDF info string for the hybrid combiner -- vault format v0.2.
+HYBRID_KEM_INFO_V02: Final[bytes] = info_for(module="vault", purpose="kem", version="v0.2")
+
+#: Backwards-compatible alias for v0.1 callers (pre-format-version code).
+HYBRID_KEM_INFO: Final[bytes] = HYBRID_KEM_INFO_V01
+
+
+def kem_info_for_format(format_version: int) -> bytes:
+    """Return the HKDF info string for a given vault ``format_version``.
+
+    Parameters
+    ----------
+    format_version:
+        Vault format version. ``1`` for v0.1 vaults, ``2`` for v0.2 vaults.
+
+    Raises
+    ------
+    SignatureError
+        If ``format_version`` is not in ``{1, 2}``.
+    """
+    if format_version == 1:
+        return HYBRID_KEM_INFO_V01
+    if format_version == 2:
+        return HYBRID_KEM_INFO_V02
+    raise SignatureError(
+        f"unsupported vault format_version: {format_version}",
+        error_code="vault.kem.bad_format_version",
+    )
 
 #: Maximum sane component length used for malformed-input rejection.
 _MAX_COMPONENT_LEN: Final[int] = 1 << 20  # 1 MiB; far above any FIPS sizes.
@@ -292,7 +324,12 @@ def _parse_ciphertext(blob: bytes) -> tuple[bytes, bytes]:
 # ---------------------------------------------------------------------------
 
 
-def _combine(ss_x25519: bytes, ss_mlkem768: bytes) -> bytes:
+def _combine(
+    ss_x25519: bytes,
+    ss_mlkem768: bytes,
+    *,
+    format_version: int = 1,
+) -> bytes:
     if len(ss_x25519) != X25519_PUBKEY_LEN:
         raise SignatureError(
             f"X25519 shared secret must be {X25519_PUBKEY_LEN} bytes, got {len(ss_x25519)}",
@@ -307,7 +344,7 @@ def _combine(ss_x25519: bytes, ss_mlkem768: bytes) -> bytes:
     return hkdf_sha256(
         ikm=ss_x25519 + ss_mlkem768,
         salt=b"",
-        info=HYBRID_KEM_INFO,
+        info=kem_info_for_format(format_version),
         length=HYBRID_KEM_SHARED_SECRET_LEN,
     )
 
@@ -359,13 +396,22 @@ def generate_keypair() -> HybridKemKeypair:
     )
 
 
-def encapsulate(recipient_public: bytes) -> tuple[bytes, bytes]:
+def encapsulate(
+    recipient_public: bytes,
+    *,
+    format_version: int = 1,
+) -> tuple[bytes, bytes]:
     """Encapsulate a fresh hybrid shared secret to ``recipient_public``.
 
     Parameters
     ----------
     recipient_public:
         Serialized hybrid public key envelope (see :func:`parse_public_key`).
+    format_version:
+        Vault format version controlling the HKDF info string used by the
+        combiner. ``1`` for v0.1 vaults, ``2`` for v0.2 vaults. The wire
+        format of the ciphertext envelope is identical across versions;
+        only the derived shared secret differs (domain separation).
 
     Returns
     -------
@@ -377,7 +423,8 @@ def encapsulate(recipient_public: bytes) -> tuple[bytes, bytes]:
     Raises
     ------
     SignatureError
-        On malformed recipient public-key envelope.
+        On malformed recipient public-key envelope, or unsupported
+        ``format_version``.
     ConfigurationError
         If liboqs-python is not installed.
     """
@@ -408,13 +455,15 @@ def encapsulate(recipient_public: bytes) -> tuple[bytes, bytes]:
             ) from exc
 
     ct = _serialize_ciphertext(eph_pub_raw, ct_m)
-    ss = _combine(ss_x, ss_m)
+    ss = _combine(ss_x, ss_m, format_version=format_version)
     return ct, ss
 
 
 def decapsulate(
     keypair: HybridKemKeypair,
     ciphertext: bytes,
+    *,
+    format_version: int = 1,
 ) -> bytes:
     """Decapsulate the hybrid shared secret using ``keypair``'s private keys.
 
@@ -424,6 +473,12 @@ def decapsulate(
         The recipient's :class:`HybridKemKeypair` (private material required).
     ciphertext:
         Length-prefixed envelope produced by :func:`encapsulate`.
+    format_version:
+        Vault format version controlling the HKDF info string used by the
+        combiner. ``1`` for v0.1 vaults, ``2`` for v0.2 vaults. The caller
+        must know this value (e.g. from the blob header byte) -- mismatch
+        produces an unrelated 32-byte derived key, which then fails AEAD
+        verification at the next layer.
 
     Returns
     -------
@@ -433,8 +488,8 @@ def decapsulate(
     Raises
     ------
     SignatureError
-        On malformed ciphertext envelope, malformed key, or component
-        decap failure.
+        On malformed ciphertext envelope, malformed key, component decap
+        failure, or unsupported ``format_version``.
     ConfigurationError
         If liboqs-python is not installed.
     """
@@ -479,4 +534,4 @@ def decapsulate(
                 error_code="vault.kem.mlkem_decap_failed",
             ) from exc
 
-    return _combine(ss_x, ss_m)
+    return _combine(ss_x, ss_m, format_version=format_version)

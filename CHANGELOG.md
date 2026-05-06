@@ -7,7 +7,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no changes)
+v0.2 development is underway. ROADMAP §3.6 (vault format v0.2 migration
+path) landed 2026-05-05; remaining v0.2 work items (§3.1–3.5, §3.7–3.9)
+are pending. v0.2 readers continue to read v0.1 entries through the
+v0.4 deprecation window per `THREAT_MODEL.md` §"Versioning and forward
+compatibility".
+
+### Added
+
+#### Vault format v0.2 migration path (ROADMAP §3.6) — 2026-05-05
+
+- `qwashed/vault/store.py`:
+  - Format-version constants: `FORMAT_VERSION_V01 = 1`,
+    `FORMAT_VERSION_V02 = 2`, `FORMAT_VERSION_CURRENT = 2`,
+    `_SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2})`.
+  - Blob-version byte constants: `BLOB_VERSION_V01`, `BLOB_VERSION_V02`,
+    `BLOB_VERSION` (= V02). The 5th byte of every entry blob is now
+    the on-disk format version, used as the dispatch discriminator
+    at decode time.
+  - Entry-AEAD info constants: `ENTRY_AEAD_INFO_V01`
+    (`b"qwashed/vault/v0.1/entry-aead"`), `ENTRY_AEAD_INFO_V02`
+    (`b"qwashed/vault/v0.2/entry-aead"`), and an
+    `_entry_aead_info_for(format_version)` dispatcher.
+  - `VaultManifest` and `EntryMetadata` dataclasses gain a
+    `format_version: int = FORMAT_VERSION_V01` field. The field is
+    *omitted* from the canonical-JSON body when `== 1`, preserving
+    v0.1 byte-identical signatures.
+  - `_seal_blob(..., format_version=FORMAT_VERSION_CURRENT)` threads
+    the target format through `encapsulate(...)` and
+    `_entry_aead_info_for(...)`, writing the correct blob-version
+    byte at offset 4.
+  - `_open_blob(...)` reads the blob-version byte, validates against
+    `_SUPPORTED_FORMAT_VERSIONS`, and dispatches
+    `decapsulate(format_version=...)` plus
+    `_entry_aead_info_for(...)` accordingly.
+  - New `_peek_blob_version(blob_bytes)` helper reads on-disk format
+    without decrypting (used by `Vault.upgrade` for fast
+    skip-already-current).
+  - Sign/verify/parse helpers for manifest and metadata
+    (`_sign_manifest` / `_verify_manifest` / `_parse_manifest`,
+    `_sign_metadata` / `_verify_metadata` / `_parse_metadata`)
+    widened to thread and validate `format_version`.
+  - New `UpgradeReport` frozen dataclass:
+    `(upgraded: tuple[str, ...], already_current: tuple[str, ...],
+    target_format_version: int)`.
+  - New `Vault.upgrade(*, target_format_version=FORMAT_VERSION_CURRENT)`
+    method. Algorithm: snapshot `self.list()`; for each entry, peek
+    the blob-version byte and skip if already at target; cross-check
+    `meta.format_version == blob_version` (fail-closed with
+    `SignatureError` on mismatch — defends against forged
+    meta-vs-blob version skew); decrypt into a `bytearray` (mutable,
+    scrubbable); re-seal at `target_format_version`; atomic-write new
+    blob then new meta; append a signed `"upgrade"` audit-log line;
+    zero the plaintext bytearray in `finally` before any disk I/O;
+    rewrite the manifest at `target_format_version` only when
+    something changed (idempotent no-op for already-current vaults).
+- `qwashed/vault/hybrid_kem.py`:
+  - `HYBRID_KEM_INFO_V01` (`b"qwashed/vault/v0.1/kem"`) and
+    `HYBRID_KEM_INFO_V02` (`b"qwashed/vault/v0.2/kem"`) constants;
+    `kem_info_for_format(format_version)` helper. `format_version`
+    parameter threaded through `_combine`, `encapsulate`,
+    `decapsulate`.
+- `qwashed/vault/audit_log.py`:
+  - `"upgrade"` added to the `OPS` frozenset and the `Op` `Literal`
+    type. Upgrade events are now first-class audit-log entries
+    (signed and hash-chained alongside `init`, `put`, `get`, `verify`,
+    `list`, `export`, `recipients`).
+- `qwashed/vault/cli.py`:
+  - New `qwashed vault upgrade [--path PATH]` subparser and
+    `_vault_upgrade` handler. Exits 1 on `SignatureError`, 2 on other
+    `QwashedError`, 0 on success. Prints upgraded / already-current
+    counts and the target format version.
+  - `vault_subs` metavar updated to
+    `{init,put,get,list,verify,upgrade,export,recipients}`.
+  - Module docstring updated to list the `upgrade` subcommand.
+- `tests/vault/test_format_migration.py` (NEW, 21 tests across 7
+  classes):
+  - `TestNewVaultIsV02` (4 tests): fresh vaults write manifest and
+    entries at v0.2.
+  - `TestV01ReadableByV02Reader` (4 tests): legacy entries readable
+    by v0.2 reader; v0.1 manifest and meta omit the `format_version`
+    field entirely (byte-identical with v0.1 signatures).
+  - `TestUpgrade` (6 tests): full migration round-trip; plaintext
+    byte-identical pre/post upgrade; idempotent (second upgrade is a
+    no-op); audit log shows one `"upgrade"` line per migrated entry;
+    original `"put"` lines preserved; no-op on already-current vault.
+  - `TestMixedFormatVault` (2 tests): mixed v0.1 / v0.2 vaults
+    readable; upgrade migrates only the legacy entries.
+  - `TestNoPlaintextSpill` (1 test): a distinctive plaintext marker
+    inserted before upgrade never appears in any vault file
+    afterwards.
+  - `TestDefenses` (2 tests): rejects unsupported
+    `target_format_version`; rejects `meta.format_version` !=
+    blob-version-byte mismatch with `SignatureError`.
+  - `TestFormatVersionConstants` (2 tests): sanity checks on the
+    constants block.
+
+### Changed
+
+- New vaults default to format v0.2 (HKDF info
+  `qwashed/vault/v0.2/{kem,entry-aead}`). v0.1 vaults remain readable;
+  use `qwashed vault upgrade [--path PATH]` to migrate.
+- The new symbols (`UpgradeReport`, `FORMAT_VERSION_V01`,
+  `FORMAT_VERSION_V02`, `FORMAT_VERSION_CURRENT`,
+  `BLOB_VERSION_V01`, `BLOB_VERSION_V02`, `ENTRY_AEAD_INFO_V01`,
+  `ENTRY_AEAD_INFO_V02`) are exposed on the `qwashed.vault.store` and
+  `qwashed.vault.hybrid_kem` modules, following the existing convention
+  of submodule access (the package `__init__.py` keeps an empty
+  `__all__`).
+
+### Verified
+
+- macOS Darwin arm64 / Python 3.13.2 with `[audit]` and `[vault]`
+  extras: `pytest` 438 passing + 1 skipped (the pre-existing
+  conditional sslyze-not-installed test). 21 of those passes are new
+  in `tests/vault/test_format_migration.py`. `mypy --strict qwashed/`
+  clean (unchanged surface). `ruff check .` and `ruff format --check .`
+  clean.
+- Backward compatibility: v0.1 vaults written before this change
+  continue to verify and read under v0.2 readers. The omit-when-1
+  rule on the canonical-JSON body preserves v0.1 manifest / metadata
+  signatures byte-identically.
+- Plaintext-spill defense: the `TestNoPlaintextSpill` test scans every
+  file under the vault root after upgrade for a unique 32-byte
+  plaintext marker and asserts zero hits.
+- Audit-log integrity: hash chain still verifies post-upgrade; the
+  new `"upgrade"` op is signed under the same hybrid Ed25519 ||
+  ML-DSA-65 key as every other op.
+
+### Documentation
+
+- `docs/VAULT_GUIDE.md`: new "Migrating v0.1 vaults to v0.2" section
+  documenting the upgrade subcommand, the deprecation window, the
+  re-encryption algorithm, the no-plaintext-spill guarantee, the
+  defenses (unsupported target, meta-vs-blob mismatch, audit log),
+  and mixed-format-vault behavior.
 
 ## [0.1.0] — 2026-04-30
 

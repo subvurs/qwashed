@@ -15,6 +15,10 @@ Subcommands
     List every signed entry's metadata (ulid, name, size, created_at).
 * ``qwashed vault verify [--path PATH]``
     Walk the manifest, identity, every entry, and the audit-log chain.
+* ``qwashed vault upgrade [--path PATH]``
+    Re-encrypt legacy v0.1 entries to the current vault format (v0.2).
+    Plaintext stays in memory; each migration appends a signed
+    audit-log line. Idempotent.
 * ``qwashed vault export <ulid> --recipient FP [--path PATH] [--output FILE]``
     Re-encrypt entry to a recipient and emit a self-contained signed
     bundle.
@@ -284,6 +288,45 @@ def _vault_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _vault_upgrade(args: argparse.Namespace) -> int:
+    """Implement ``qwashed vault upgrade``.
+
+    Re-encrypts every legacy entry in the vault to the current vault
+    format version (v0.2). Plaintext stays in memory; nothing is
+    written to disk in cleartext. Each migration is a hybrid-signed
+    audit-log line. The command is idempotent: a vault already at the
+    current format reports zero entries upgraded.
+    """
+    try:
+        vault = _open_existing(args)
+    except SignatureError as exc:
+        _emit_error("qwashed vault upgrade", exc)
+        return 1
+    except QwashedError as exc:
+        _emit_error("qwashed vault upgrade", exc)
+        return 2
+
+    try:
+        report = vault.upgrade()
+    except SignatureError as exc:
+        _emit_error("qwashed vault upgrade", exc)
+        return 1
+    except QwashedError as exc:
+        _emit_error("qwashed vault upgrade", exc)
+        return 2
+
+    sys.stdout.write(
+        (
+            f"qwashed vault upgrade: {len(report.upgraded)} upgraded, "
+            f"{len(report.already_current)} already at v{report.target_format_version} "
+            f"({vault.root})\n"
+        )
+    )
+    for ulid in report.upgraded:
+        sys.stdout.write(f"  upgraded\t{ulid}\n")
+    return 0
+
+
 def _vault_export(args: argparse.Namespace) -> int:
     """Implement ``qwashed vault export <ulid> --recipient FP``."""
     try:
@@ -439,7 +482,7 @@ def build_vault_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     )
     vault_subs = vault_parser.add_subparsers(
         dest="vault_command",
-        metavar="{init,put,get,list,verify,export,recipients}",
+        metavar="{init,put,get,list,verify,upgrade,export,recipients}",
         required=False,
     )
 
@@ -503,6 +546,21 @@ def build_vault_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     )
     _add_path_arg(verify_p)
     verify_p.set_defaults(func=_vault_verify)
+
+    # upgrade
+    upgrade_p = vault_subs.add_parser(
+        "upgrade",
+        help="re-encrypt legacy v0.1 entries to the current vault format",
+        description=(
+            "Walk every entry in the vault, decrypt in memory, and "
+            "re-encrypt to the current vault format (v0.2). Each "
+            "migration appends a hybrid-signed audit-log line. The "
+            "operation is idempotent: a vault already at the current "
+            "format reports zero entries upgraded."
+        ),
+    )
+    _add_path_arg(upgrade_p)
+    upgrade_p.set_defaults(func=_vault_upgrade)
 
     # export
     export_p = vault_subs.add_parser(

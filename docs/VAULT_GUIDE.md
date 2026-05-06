@@ -415,6 +415,166 @@ ULID* it touched.
 
 ---
 
+## Migrating v0.1 vaults to v0.2
+
+Starting with v0.2-dev (2026-05-05), Qwashed introduces a vault on-disk
+format version. The cryptographic algorithms are unchanged
+(X25519 || ML-KEM-768 KEM, Ed25519 || ML-DSA-65 signatures, AES-256-GCM
+AEAD, Argon2id-wrapped passphrase) — what changes is the HKDF info
+strings used for domain separation:
+
+| Format | KEM HKDF info             | Entry-AEAD HKDF info             |
+|--------|---------------------------|----------------------------------|
+| v0.1   | `qwashed/vault/v0.1/kem`  | `qwashed/vault/v0.1/entry-aead`  |
+| v0.2   | `qwashed/vault/v0.2/kem`  | `qwashed/vault/v0.2/entry-aead`  |
+
+The format bump exists to exercise the migration machinery before there
+is an emergency reason to use it (e.g. a future algorithm swap).
+
+### When to migrate
+
+You can migrate at any time, or never. **v0.2 readers continue to read
+v0.1 entries through the v0.4 deprecation window** (per
+`THREAT_MODEL.md` §"Versioning and forward compatibility"). New vaults
+created on v0.2-dev or later are automatically v0.2; existing v0.1
+vaults stay at v0.1 until you explicitly upgrade them.
+
+Migrate when:
+
+- You are doing routine maintenance and want to bring the vault
+  on-disk format up to date.
+- You are about to add a large number of new entries and prefer the
+  whole vault sit at the same format version.
+- You are preparing a disclosure or hand-off and want the audit log
+  to record a clean format-bump line for traceability.
+
+Do not migrate when:
+
+- The vault is already in active use by another process. The upgrade
+  command takes the vault lock and re-encrypts every entry; do not
+  interrupt it.
+- You are operating under coercion. Migration changes every entry's
+  on-disk ciphertext and writes a new audit-log line — both are
+  evidence of activity.
+
+### How to migrate
+
+```bash
+# Default vault root (~/.qwashed):
+qwashed vault upgrade
+
+# Explicit path:
+qwashed vault upgrade --path /secure/vol/.qwashed
+```
+
+You will be prompted for the vault passphrase (or it can be supplied
+via the `QWASHED_VAULT_PASSPHRASE` env var, same as every other vault
+operation).
+
+The command prints a report:
+
+```
+Upgraded 42 entries to format v2.
+Already at v2: 8 entries.
+```
+
+It is **idempotent**: running `qwashed vault upgrade` against a vault
+that is already at v0.2 is a fast no-op (every entry's blob-version
+byte is peeked, not decrypted, before any work happens).
+
+Exit codes:
+
+- `0` — success (anything from "all entries migrated" to "nothing to
+  do").
+- `1` — signature error or audit-log integrity failure (treat as
+  tamper; see "I think the vault directory was tampered with." below).
+- `2` — structural error (cannot open vault, bad passphrase, IO
+  failure).
+
+### What gets re-encrypted, what does not
+
+Migration re-encrypts every entry that is below the target format
+version. For each migrated entry:
+
+1. The blob is read from disk.
+2. The KEM ciphertext is decapsulated against the vault's hybrid
+   identity, deriving the v0.1 entry-AEAD key.
+3. The entry plaintext is decrypted into a **mutable bytearray**
+   (never a normal `bytes` object — bytearrays can be overwritten in
+   place).
+4. The plaintext is re-sealed at the target format: a fresh KEM
+   ciphertext is generated using the v0.2 KEM HKDF info, and the
+   AEAD key is derived using the v0.2 entry-AEAD HKDF info.
+5. The new blob is atomically written, then the new metadata file
+   is atomically written (same fsync-then-rename discipline as
+   `vault put`).
+6. A signed `"upgrade"` line is appended to the audit log,
+   referencing the entry's ULID.
+7. The plaintext bytearray is overwritten with zeros in a `finally`
+   block before any further code runs, including the next entry.
+
+The vault manifest is rewritten exactly once at the end if anything
+actually changed — preserving `vault_id` and `created_at`, just bumping
+`format_version`.
+
+### No-plaintext-spill guarantee
+
+The migration path **never writes plaintext to disk**. There is no
+temporary file, no swap-back-out, no debug dump. The
+`tests/vault/test_format_migration.py::TestNoPlaintextSpill` test
+inserts a unique 32-byte plaintext marker into a vault entry, runs the
+upgrade, then walks every file under the vault root and asserts the
+marker appears nowhere. That test is part of the standard test suite.
+
+If the upgrade is interrupted mid-flight (e.g. you `kill -9` the
+process), partially-migrated state is consistent: each entry is
+either fully old or fully new, and the audit log only contains
+`"upgrade"` lines for entries that were fully written. There is no
+"half-migrated" entry state.
+
+### Defenses
+
+- **Unsupported target rejected.** Calling `Vault.upgrade(target_format_version=99)`
+  fails fast with a `QwashedError` before any entry is touched. The
+  CLI does not expose this argument; the v0.2 upgrade is always to
+  the current format constant.
+- **Mismatch detected.** If an entry's `meta.format_version` does
+  not match the format version recorded in the entry's blob-version
+  byte, upgrade fails with `SignatureError` rather than silently
+  re-encrypting. This defends against forged metadata where an
+  attacker has replaced one of `blob` / `meta` and not the other.
+- **Audit log first-class.** The `"upgrade"` op is in the same
+  hash-chained, hybrid-signed audit log as `init`, `put`, `get`,
+  `verify`, `list`, `export`, `recipients`. A future `vault verify`
+  re-validates every upgrade line.
+
+### After migration
+
+- `qwashed vault verify` should return `exit 0` on the migrated
+  vault. Run it.
+- The audit log gains one signed `"upgrade"` line per migrated
+  entry. The `"put"` lines from the original entries are preserved
+  unchanged.
+- Retrieval (`qwashed vault get`) returns bytes-identical plaintext
+  to what was stored — migration is a re-encryption, not a
+  re-encoding.
+- `manifest.json` now contains a `"format_version": 2` field. v0.1
+  vaults omitted this field entirely (the canonical-JSON body omits
+  `format_version` when it equals 1, which is why v0.1 signatures
+  remained byte-identical pre-existing-implementation).
+
+### Mixed-format vaults
+
+Adding a new entry to a v0.1 vault (without first running
+`vault upgrade`) creates a v0.2 entry alongside the v0.1 entries.
+Mixed-format vaults are valid and fully supported. The v0.2 reader
+dispatches per-entry on the on-disk blob-version byte, so reads,
+verifies, and exports all work transparently across the mix. Running
+`qwashed vault upgrade` on such a vault migrates only the v0.1
+entries and leaves the v0.2 entries untouched.
+
+---
+
 ## Recovery and disaster scenarios
 
 ### "I forgot my passphrase."
@@ -503,4 +663,4 @@ not assume rotation undoes prior exposure.
 
 ---
 
-*Last updated: 2026-04-30 (Phase 3 release).*
+*Last updated: 2026-05-05 (v0.2-dev: ROADMAP §3.6 vault format migration).*

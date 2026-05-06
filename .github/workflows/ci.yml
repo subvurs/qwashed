@@ -91,39 +91,42 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
 
-      - name: System deps (liboqs on Linux)
-        if: runner.os == 'Linux'
+      - name: System deps (liboqs from source)
         run: |
           # liboqs-python is a thin ctypes wrapper around the upstream
-          # liboqs C library — it does NOT bundle liboqs.so. Ubuntu does
-          # not ship liboqs in its main repos either, so we build from
-          # source. Pin to a stable upstream tag so CI is deterministic.
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev git
+          # liboqs C library — it does NOT bundle liboqs.{so,dylib}.
+          # Ubuntu does not ship liboqs in its main repos, and Homebrew's
+          # liboqs bottle on macos-14 lands in /opt/homebrew/Cellar but
+          # the symlink into /opt/homebrew/lib is not always created
+          # (the loader then falls back to its self-install path which
+          # cannot write to /opt/homebrew without sudo).
+          #
+          # Building from source to /usr/local/{lib,include} is the most
+          # deterministic option across both runners: /usr/local/lib is
+          # on the default dlopen search path on macOS and the default
+          # ld.so search path on Linux (after `ldconfig`). The pinned
+          # 0.14.0 tag matches the liboqs-python>=0.14.0 extras pin in
+          # pyproject.toml.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y cmake ninja-build libssl-dev git
+          else
+            brew install cmake ninja
+          fi
           git clone --depth 1 --branch 0.14.0 https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs
           cmake -GNinja -S /tmp/liboqs -B /tmp/liboqs/build \
             -DBUILD_SHARED_LIBS=ON \
             -DOQS_BUILD_ONLY_LIB=ON \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
           cmake --build /tmp/liboqs/build --parallel
           sudo cmake --install /tmp/liboqs/build
-          sudo ldconfig
-
-      - name: System deps (liboqs on macOS)
-        if: runner.os == 'macOS'
-        run: |
-          # Homebrew ships liboqs as a first-class formula on macos-14
-          # (Apple Silicon). `brew install` is idempotent on the cached
-          # toolchain image; do not silence its exit code so a real
-          # failure here surfaces as a job failure rather than a
-          # downstream `RuntimeError: No oqs shared libraries found`.
-          brew install liboqs
-          # liboqs-python's loader uses ctypes.util.find_library() which
-          # does not probe /opt/homebrew/lib on Apple Silicon runners.
-          # OQS_INSTALL_PATH points the loader at $PATH/lib explicitly.
-          # Persist via $GITHUB_ENV so subsequent steps (pip install,
-          # pytest) see it.
-          echo "OQS_INSTALL_PATH=/opt/homebrew" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo ldconfig; fi
+          # Pin OQS_INSTALL_PATH so the loader probes /usr/local/lib
+          # directly instead of relying on ctypes.util.find_library()'s
+          # heuristics (which differ across Python builds and SIP
+          # configurations on macOS).
+          echo "OQS_INSTALL_PATH=/usr/local" >> "$GITHUB_ENV"
 
       - name: Install Qwashed with full extras
         run: |

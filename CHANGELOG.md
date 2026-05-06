@@ -8,12 +8,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 v0.2 development is underway. ROADMAP §3.6 (vault format v0.2 migration
-path) landed 2026-05-05; remaining v0.2 work items (§3.1–3.5, §3.7–3.9)
-are pending. v0.2 readers continue to read v0.1 entries through the
-v0.4 deprecation window per `THREAT_MODEL.md` §"Versioning and forward
-compatibility".
+path) landed 2026-05-05; ROADMAP §3.4 (hand-rolled `NativeTlsProbe`,
+sslyze becomes opt-in via `[audit-deep]`) landed 2026-05-06; remaining
+v0.2 work items (§3.1–3.3, §3.5, §3.7–3.9) are pending. v0.2 readers
+continue to read v0.1 entries through the v0.4 deprecation window per
+`THREAT_MODEL.md` §"Versioning and forward compatibility".
 
 ### Added
+
+#### Hand-rolled TLS probe / `NativeTlsProbe` (ROADMAP §3.4) — 2026-05-06
+
+- `qwashed/audit/_tls_wire.py` (NEW, internal): self-contained TLS 1.2 /
+  1.3 wire-format helpers built on `cryptography`'s primitives only —
+  no `ssl`-module reliance, no third-party TLS library. Module surface:
+  - Record / handshake framing constants (record / handshake / extension
+    type codes per RFC 8446 + RFC 5246, fixed HelloRetryRequest
+    `random` per §4.1.4, `TLS_1_2`/`TLS_1_3` legacy/protocol versions).
+  - `build_client_hello(hostname, *, server_name=...)`: emits a
+    deterministic ClientHello with `supported_versions` (TLS 1.2 + 1.3),
+    `signature_algorithms` (ed25519, ML-DSA OIDs, ECDSA / RSA-PSS),
+    `supported_groups` (X25519, X25519MLKEM768 codepoint
+    `0x11EC` per draft-kwiatkowski-tls-ecdhe-mlkem, P-256, P-384), and a
+    fresh X25519 `key_share`. Returns `(client_hello_bytes, material)`
+    where `material` carries the X25519 private key, the random, and the
+    advertised cipher-suite list. SNI is omitted for IPv4 / IPv6
+    literals (RFC 6066 §3) and for empty hostnames.
+  - `HandshakeReader`: byte-stream reassembler that consumes record-layer
+    fragments and yields complete handshake messages without buffering
+    the whole transcript.
+  - `parse_server_hello(handshake_body)`: returns `ServerHelloFields`
+    (`legacy_version`, `random`, `legacy_session_id_echo`,
+    `cipher_suite`, `compression_method`, `extensions`,
+    `selected_version`, `selected_group_id`, `selected_key_share`).
+    Detects HelloRetryRequest via the fixed SHA-256 `random`.
+  - `parse_extensions(buf)`, `parse_certificate(handshake_body)`,
+    `parse_server_key_exchange_named_curve(ske_body)`: typed
+    extension-block readers.
+  - `cert_signature_algorithm_friendly_name(cert)`: maps X.509 OIDs to
+    short names (`ed25519`, `id-ml-dsa-65`, `sha256WithRSAEncryption`,
+    etc.); unknown OIDs render as `oid:1.2.3.4` with no false-confidence
+    label.
+  - `derive_tls13_server_handshake_keys(...)`: full RFC 8446 §7.1 key
+    schedule (HKDF-Extract / Derive-Secret / HKDF-Expand-Label) over a
+    transcript hash, returning `(server_handshake_key, server_handshake_iv,
+    hash_name, key_len)` for AES-128-GCM-SHA256 and AES-256-GCM-SHA384.
+    Hash names are stored as explicit strings in `TLS13_CIPHER_PARAMS`
+    so mypy --strict is clean against `cryptography`'s `HashAlgorithm.name`
+    descriptor.
+  - `friendly_kex_name(group_id)` / `friendly_cipher_suite_name(suite_id)`:
+    pretty labels for findings (`X25519`, `X25519MLKEM768`,
+    `TLS_AES_128_GCM_SHA256`, etc.).
+  - `TlsWireError`: typed parsing failure (length-prefix overflow,
+    truncated record, unknown extension structure). Always surfaces as
+    a fail-closed `ProbeResult.status = "handshake_failed"` rather than
+    propagating to the CLI.
+- `qwashed/audit/probe.py`:
+  - New `NativeTlsProbe` class implementing the `Probe` ABC. `probe(target)`:
+    1. Rejects non-TLS protocols up-front.
+    2. Resolves and connects to `(host, port)` with `socket.create_connection`
+       at the configured timeout.
+    3. Calls `_handshake()` which builds a ClientHello via
+       `_w.build_client_hello(...)`, sends it, and reads ServerHello
+       handshake records via `_w.HandshakeReader`.
+    4. Branches on `ServerHelloFields.selected_version`:
+       - TLS 1.3 → `_finish_tls13(...)`: validates the X25519 key_share,
+         performs ECDHE via `material.x25519_priv.exchange(peer_pub)`,
+         derives server handshake keys via
+         `_w.derive_tls13_server_handshake_keys(...)` over the
+         transcript hash, decrypts subsequent records with AES-GCM,
+         skips ChangeCipherSpec, feeds plaintext into a new
+         `HandshakeReader`, and parses out the Certificate handshake
+         message for signature-algorithm classification.
+       - TLS 1.2 → `_finish_tls12(...)`: reads cleartext records,
+         processes `Certificate` + `ServerKeyExchange` +
+         `ServerHelloDone`, classifies the named curve from
+         `ServerKeyExchange`.
+    5. Rejects HelloRetryRequest, unsupported versions
+       (SSLv3 / TLS 1.0 / 1.1) with `ProbeResult.error_detail =
+       "tls_version_unsupported"`, and any `TlsWireError` /
+       `OSError` / `TimeoutError` with `status = "handshake_failed"` /
+       `"unreachable"` and a typed error detail.
+  - `_format_tls_version(version)` helper: maps `TLS_1_3 → "TLSv1.3"`,
+    `TLS_1_2 → "TLSv1.2"`, returns `None` for SSLv3 / TLS 1.0 / 1.1
+    (caller falls through to `tls_version_unsupported`).
+  - `NativeTlsProbe` exposed on the module's `__all__`.
+  - `probe_target(...)` default `probe_impl` flipped from
+    `SslyzeTlsProbe()` to `NativeTlsProbe()`.
+- `qwashed/audit/cli.py`:
+  - New `_probe_for_args(args) -> Probe` dispatcher: reads `args.probe`
+    (`{native, stdlib, sslyze}`, default `native`) and `args.probe_timeout`
+    (default `DEFAULT_TIMEOUT_SECONDS`), constructs the requested
+    implementation. Unknown selectors raise `ConfigurationError`
+    (`exit 2`).
+  - `_audit_run(...)` now passes `probe_impl=_probe_for_args(args)` into
+    `run_audit(...)` instead of the prior `probe_impl=None` (which
+    silently fell back to whatever default the pipeline picked).
+  - `audit run` argparse adds `--probe {native,stdlib,sslyze}` (default
+    `native`) and `--probe-timeout SECONDS` (default
+    `DEFAULT_TIMEOUT_SECONDS`).
+- `tests/audit/test_probe.py` (+22 new tests across 7 classes):
+  - `TestNativeTlsProbe` (6): round-trip against the loopback TLS
+    fixture (asserts `status="ok"`, `protocol_version` ∈
+    {`TLSv1.2`, `TLSv1.3`}, `cipher_suite` non-empty,
+    `sig_algorithm` non-empty, `kex_algorithm` includes `X25519` for
+    TLS 1.3); unreachable port; DNS failure; SSH target rejected with
+    an error string pointing at `[audit-ssh]`; invalid timeout via
+    `ConfigurationError`; non-TLS garbage on a plain TCP socket
+    rejected as `handshake_failed`.
+  - `TestTlsWireSni` (5): DNS labels accepted, IPv4 + IPv6 literals
+    rejected (RFC 6066), empty hostnames rejected, non-ASCII rejected
+    (punycode round-trips).
+  - `TestHandshakeReader` (3): single-message read; fragmented across
+    feeds; multiple handshake messages in one feed.
+  - `TestParseServerHello` (1): too-short body raises `TlsWireError`.
+  - `TestCertSigAlgoFriendlyName` (4): `sha256WithRSAEncryption`,
+    `ed25519`, `id-ml-dsa-65` (NIST CSOR
+    `2.16.840.1.101.3.4.3.18`), and an unknown OID returning
+    `oid:9.9.9.9`.
+  - `TestBuildClientHello` (2): emits a valid record header; SNI
+    omitted for IP literals (size delta check).
+  - `TestProbeTargetDefault` (1): default codepath through
+    `probe_target(...)` reachable post-flip.
+
+### Changed
+
+- **Default TLS probe is now `NativeTlsProbe`** (hand-rolled on
+  `cryptography` only; no `sslyze`, no `ssl` stdlib reliance for the
+  handshake). `qwashed audit run` users with no extras installed
+  (`pip install qwashed`) can now run a full PQ-posture audit without
+  pulling sslyze or any other TLS library. Existing `[audit]` users
+  continue to work unchanged via the meta-extra alias.
+- **`[audit]` extras split** in `pyproject.toml`:
+  - `audit-deep = ["sslyze>=6.0"]` — sslyze for callers who want its
+    deeper enumeration (cipher-suite scan surface, vulnerability scans,
+    JA3 fingerprints).
+  - `audit-ssh = ["paramiko>=3.4"]` — paramiko for SSH probing.
+  - `audit = ["qwashed[audit-deep,audit-ssh]"]` — meta-extra preserved
+    as the v0.1 upgrade alias.
+  - The base install (no extras) now ships a fully functional TLS
+    probe via `cryptography` (already a core dependency).
+- `qwashed audit run --probe sslyze` selects the sslyze backend when
+  `[audit-deep]` is installed; raises `ConfigurationError` with an
+  install-extras hint otherwise. `--probe stdlib` selects the
+  v0.1-style `StdlibTlsProbe` (Python `ssl` module).
+
+### Verified
+
+- macOS Darwin arm64 / Python 3.13.2 with `[audit]` and `[vault]`
+  extras: `pytest` 460 passing + 1 skipped (the pre-existing
+  conditional sslyze-not-installed test, retained because
+  `[audit-deep]` keeps the install path optional). 22 of those passes
+  are new in `tests/audit/test_probe.py` (covering `NativeTlsProbe`,
+  `_tls_wire.HandshakeReader`, `_tls_wire.build_client_hello`'s SNI
+  rules, ServerHello parsing, certificate signature-OID friendly-name
+  mapping, and the `probe_target` default).
+- `mypy --strict qwashed/` clean across 28 source files (one
+  informational note about an unused override block for `paramiko.*`,
+  unchanged from v0.1.0). Hash-class name mypy gotcha resolved by
+  storing `("sha256", 16)` / `("sha384", 32)` as explicit strings in
+  `_tls_wire.TLS13_CIPHER_PARAMS` rather than relying on
+  `cryptography.hashes.SHA256.name`'s descriptor.
+- `ruff check .` and `ruff format --check .` clean.
+- Backward compatibility: pre-existing `StdlibTlsProbe` and
+  `SslyzeTlsProbe` codepaths unchanged, all v0.1 golden audit fixtures
+  still byte-identical under `--deterministic`.
+
+### Documentation
+
+- `docs/AUDIT_GUIDE.md`: new "Choosing a TLS probe backend" section
+  documenting the `--probe {native, stdlib, sslyze}` selector, the
+  install-extras matrix (`[audit-deep]` for sslyze, `[audit-ssh]` for
+  paramiko), and the rationale for `native` becoming the default.
+- `docs/ROADMAP.md`: §3.4 marked `LANDED 2026-05-06` with implementation
+  summary mirroring this CHANGELOG entry.
 
 #### Vault format v0.2 migration path (ROADMAP §3.6) — 2026-05-05
 

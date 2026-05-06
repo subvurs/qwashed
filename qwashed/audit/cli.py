@@ -44,6 +44,13 @@ from typing import Any
 
 from qwashed import __version__
 from qwashed.audit.pipeline import run_audit
+from qwashed.audit.probe import (
+    DEFAULT_TIMEOUT_SECONDS,
+    NativeTlsProbe,
+    Probe,
+    SslyzeTlsProbe,
+    StdlibTlsProbe,
+)
 from qwashed.audit.profile_loader import (
     available_profiles,
     load_profile,
@@ -196,6 +203,29 @@ def _profile_for_args(args: argparse.Namespace) -> ThreatProfile:
     return load_profile(args.profile)
 
 
+def _probe_for_args(args: argparse.Namespace) -> Probe:
+    """Construct the probe implementation requested by the CLI.
+
+    Default is ``NativeTlsProbe`` (Qwashed v0.2): full PQ posture with
+    only stdlib + ``cryptography``, no extras required. ``stdlib`` is the
+    legacy Python-``ssl`` probe (no KEX / no signature visibility) and
+    is kept for callers in air-gapped environments. ``sslyze`` requires
+    the ``[audit-deep]`` extra.
+    """
+    timeout = float(getattr(args, "probe_timeout", DEFAULT_TIMEOUT_SECONDS))
+    selected = getattr(args, "probe", "native")
+    if selected == "native":
+        return NativeTlsProbe(timeout_seconds=timeout)
+    if selected == "stdlib":
+        return StdlibTlsProbe(timeout_seconds=timeout)
+    if selected == "sslyze":
+        return SslyzeTlsProbe(timeout_seconds=timeout)
+    raise ConfigurationError(
+        f"unknown probe implementation {selected!r}; expected one of native|stdlib|sslyze",
+        error_code="audit.cli.bad_probe",
+    )
+
+
 def _frozen_timestamp(deterministic: bool) -> str:
     if deterministic:
         return "2026-01-01T00:00:00Z"
@@ -219,6 +249,7 @@ def _audit_run(args: argparse.Namespace) -> int:
     try:
         targets = _load_targets(config_path)
         profile = _profile_for_args(args)
+        probe_impl = _probe_for_args(args)
     except QwashedError as exc:
         sys.stderr.write(f"qwashed audit: {exc} ({exc.error_code})\n")
         return 2
@@ -236,7 +267,7 @@ def _audit_run(args: argparse.Namespace) -> int:
         report = run_audit(
             targets,
             profile=profile,
-            probe_impl=None,  # default: StdlibTlsProbe
+            probe_impl=probe_impl,
             generated_at=_frozen_timestamp(deterministic),
             qwashed_version=_frozen_version(deterministic),
         )
@@ -397,6 +428,22 @@ def build_audit_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
             "freeze timestamp, version string, and signing key seed so "
             "the JSON output is bit-identical across runs (test only)"
         ),
+    )
+    run_parser.add_argument(
+        "--probe",
+        choices=("native", "stdlib", "sslyze"),
+        default="native",
+        help=(
+            "TLS probe implementation: 'native' (default; full PQ posture, "
+            "no extras required), 'stdlib' (no KEX / no signature visibility), "
+            "or 'sslyze' (requires the [audit-deep] extra)"
+        ),
+    )
+    run_parser.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=(f"per-target probe timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS})"),
     )
     run_parser.set_defaults(func=_audit_run)
 

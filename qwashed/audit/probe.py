@@ -43,18 +43,23 @@ to v0.1.1).
 
 from __future__ import annotations
 
+import hashlib
 import socket
 import ssl
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Final
 
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+
+from qwashed.audit import _tls_wire as _w
 from qwashed.audit.schemas import AuditTarget, ProbeResult
 from qwashed.core.errors import ConfigurationError
 
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "MAX_RESPONSE_BYTES",
+    "NativeTlsProbe",
     "Probe",
     "SslyzeTlsProbe",
     "StaticProbe",
@@ -187,6 +192,411 @@ def _is_refused(exc: BaseException) -> bool:
     """Heuristic: does this OSError look like an active refusal?"""
     msg = str(exc).lower()
     return "refused" in msg or "reset" in msg or "connection aborted" in msg
+
+
+class NativeTlsProbe(Probe):
+    """Hand-rolled TLS probe using only stdlib + ``cryptography``.
+
+    Sends a TLS 1.3 / 1.2 dual ClientHello, parses ServerHello, and (for
+    TLS 1.3) derives the server-handshake AEAD key to decrypt the
+    encrypted handshake stream so we can read the Certificate message.
+    Captures:
+
+    * ``negotiated_protocol_version``  (TLSv1.3 / TLSv1.2 / ...)
+    * ``cipher_suite``                 (IANA name, e.g. TLS_AES_128_GCM_SHA256)
+    * ``key_exchange_group``           (X25519, X25519MLKEM768, secp256r1, ...)
+    * ``signature_algorithm``          (friendly name of leaf cert OID)
+
+    This is the default Qwashed v0.2 probe: it gives full PQ posture
+    without requiring sslyze. ``SslyzeTlsProbe`` remains available behind
+    the ``[audit-deep]`` extra for callers who want sslyze's broader
+    posture surface (cipher-suite enumeration, vulnerability scans).
+
+    Failure modes (consistent with :class:`Probe`):
+
+    * DNS / connect refused / network unreachable -> ``unreachable`` /
+      ``refused`` (status mapped from OSError text).
+    * Server speaks SSLv3 / TLS 1.0 / TLS 1.1 -> ``malformed`` with
+      ``error_detail="tls_version_unsupported"``. Auditing modern PQ
+      posture is meaningless against a TLS 1.0 endpoint; that is itself
+      a finding worth surfacing rather than silently producing data.
+    * TLS alert / framing error / unsupported cipher -> ``refused`` or
+      ``malformed`` per :class:`~qwashed.audit._tls_wire.TlsWireError`.
+    """
+
+    def __init__(self, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
+        if timeout_seconds <= 0:
+            raise ConfigurationError(
+                f"timeout_seconds must be > 0, got {timeout_seconds}",
+                error_code="audit.probe.bad_timeout",
+            )
+        self._timeout = timeout_seconds
+
+    def probe(self, target: AuditTarget) -> ProbeResult:
+        if target.protocol != "tls":
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail=(
+                    f"protocol={target.protocol!r} not supported by "
+                    "NativeTlsProbe; SSH probing requires the [audit-ssh] "
+                    "extra (v0.1.1+)"
+                ),
+            )
+
+        start = time.monotonic()
+        try:
+            with socket.create_connection(
+                (target.host, target.port), timeout=self._timeout
+            ) as sock:
+                sock.settimeout(self._timeout)
+                return self._handshake(target, sock, start)
+        except TimeoutError as exc:
+            return ProbeResult(
+                target=target,
+                status="unreachable",
+                error_detail=f"timeout after {self._timeout}s: {exc}",
+                elapsed_seconds=time.monotonic() - start,
+            )
+        except (socket.gaierror, OSError) as exc:
+            status = "refused" if _is_refused(exc) else "unreachable"
+            return ProbeResult(
+                target=target,
+                status=status,  # type: ignore[arg-type]
+                error_detail=f"{type(exc).__name__}: {exc}",
+                elapsed_seconds=time.monotonic() - start,
+            )
+        except _w.TlsWireError as exc:
+            return ProbeResult(
+                target=target,
+                status=exc.status,  # type: ignore[arg-type]
+                error_detail=str(exc),
+                elapsed_seconds=time.monotonic() - start,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail=f"unexpected probe error: {type(exc).__name__}: {exc}",
+                elapsed_seconds=time.monotonic() - start,
+            )
+
+    # ------------------------------------------------------------------
+    # Handshake plumbing
+    # ------------------------------------------------------------------
+
+    def _handshake(
+        self,
+        target: AuditTarget,
+        sock: socket.socket,
+        start: float,
+    ) -> ProbeResult:
+        material = _w.build_client_hello(target.host)
+        sock.sendall(material.record_bytes)
+
+        budget: list[int] = [0]
+
+        # Read ServerHello (always cleartext, RECORD_HANDSHAKE).
+        sh_record_type, _sh_ver, sh_payload = _w.read_record(
+            sock, budget, max_total=MAX_RESPONSE_BYTES
+        )
+        if sh_record_type == _w.RECORD_ALERT:
+            return ProbeResult(
+                target=target,
+                status="refused",
+                error_detail="server sent TLS alert in lieu of ServerHello",
+                elapsed_seconds=time.monotonic() - start,
+            )
+        if sh_record_type != _w.RECORD_HANDSHAKE:
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail=f"unexpected record content_type={sh_record_type}",
+                elapsed_seconds=time.monotonic() - start,
+            )
+
+        # Reassemble the ServerHello handshake message.
+        sh_reader = _w.HandshakeReader()
+        sh_reader.feed(sh_payload)
+        msgs = sh_reader.messages()
+        if not msgs or msgs[0][0] != _w.HS_SERVER_HELLO:
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail="missing ServerHello",
+                elapsed_seconds=time.monotonic() - start,
+            )
+        _sh_msg_type, sh_body, sh_raw = msgs[0]
+        info = _w.parse_server_hello(sh_body)
+
+        if info.is_hello_retry:
+            # We do not implement HRR. Surface as a finding rather than
+            # silently producing partial data.
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail="server sent HelloRetryRequest (not supported)",
+                elapsed_seconds=time.monotonic() - start,
+            )
+
+        version_str = _format_tls_version(info.selected_version)
+        if version_str is None:
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail="tls_version_unsupported",
+                elapsed_seconds=time.monotonic() - start,
+            )
+        cipher_name = _w.CIPHER_NAMES.get(info.cipher_suite, f"cipher_0x{info.cipher_suite:04x}")
+
+        # Branch on negotiated TLS version.
+        if info.selected_version == _w.TLS_1_3:
+            return self._finish_tls13(
+                target=target,
+                sock=sock,
+                budget=budget,
+                start=start,
+                material=material,
+                info=info,
+                ch_msg=material.handshake_message,
+                sh_msg=sh_raw,
+                version_str=version_str,
+                cipher_name=cipher_name,
+                # If sh_reader had leftover data after SH, those bytes
+                # belong to the next records (ChangeCipherSpec or
+                # encrypted handshake) and should be ignored — they
+                # cannot legally be in the same record as SH.
+            )
+        return self._finish_tls12(
+            target=target,
+            sock=sock,
+            budget=budget,
+            start=start,
+            sh_reader=sh_reader,
+            info=info,
+            version_str=version_str,
+            cipher_name=cipher_name,
+        )
+
+    # ------------------------------------------------------------------
+    # TLS 1.3 path
+    # ------------------------------------------------------------------
+
+    def _finish_tls13(
+        self,
+        *,
+        target: AuditTarget,
+        sock: socket.socket,
+        budget: list[int],
+        start: float,
+        material: _w.ClientHelloMaterial,
+        info: _w.ServerHelloInfo,
+        ch_msg: bytes,
+        sh_msg: bytes,
+        version_str: str,
+        cipher_name: str,
+    ) -> ProbeResult:
+        if info.selected_group != _w.GROUP_X25519:
+            # We only sent an X25519 key_share; if the server picked
+            # something else without an HRR, that's a protocol violation.
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail=(
+                    f"server selected unexpected group 0x{info.selected_group or 0:04x} without HRR"
+                ),
+                elapsed_seconds=time.monotonic() - start,
+            )
+        if info.server_pub_key is None or len(info.server_pub_key) != 32:
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail="server X25519 key_share missing or wrong size",
+                elapsed_seconds=time.monotonic() - start,
+            )
+        if info.cipher_suite not in _w.TLS13_CIPHER_PARAMS:
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail=(f"unsupported TLS 1.3 cipher 0x{info.cipher_suite:04x}"),
+                elapsed_seconds=time.monotonic() - start,
+            )
+
+        shared_secret = material.x25519_priv.exchange(
+            X25519PublicKey.from_public_bytes(info.server_pub_key)
+        )
+        _hash_algo, hash_name, _key_len = _w.TLS13_CIPHER_PARAMS[info.cipher_suite]
+        transcript = hashlib.new(hash_name)
+        transcript.update(ch_msg)
+        transcript.update(sh_msg)
+        transcript_after_sh = transcript.digest()
+
+        server_key, server_iv = _w.derive_tls13_server_handshake_keys(
+            shared_secret=shared_secret,
+            transcript_hash_after_sh=transcript_after_sh,
+            cipher_suite=info.cipher_suite,
+        )
+
+        hs_reader = _w.HandshakeReader()
+        seq = 0
+        sig_algo_name = ""
+        kex_group_name = _w.GROUP_NAMES.get(
+            info.selected_group, f"group_0x{info.selected_group:04x}"
+        )
+
+        # Read records until we've seen Certificate or run out of budget.
+        # The server may send CCS in cleartext (compatibility) before the
+        # encrypted stream; ignore it.
+        for _ in range(64):  # generous record cap; budget enforces real cap
+            content_type, _ver, payload = _w.read_record(sock, budget, max_total=MAX_RESPONSE_BYTES)
+            if content_type == _w.RECORD_CHANGE_CIPHER_SPEC:
+                continue
+            if content_type == _w.RECORD_ALERT:
+                return ProbeResult(
+                    target=target,
+                    status="refused",
+                    error_detail="server alert before Certificate",
+                    elapsed_seconds=time.monotonic() - start,
+                )
+            if content_type != _w.RECORD_APPLICATION_DATA:
+                return ProbeResult(
+                    target=target,
+                    status="malformed",
+                    error_detail=(
+                        f"unexpected record content_type={content_type} in TLS 1.3 encrypted phase"
+                    ),
+                    elapsed_seconds=time.monotonic() - start,
+                )
+            try:
+                inner_type, plaintext = _w.decrypt_tls13_record(
+                    payload, key=server_key, static_iv=server_iv, seq=seq
+                )
+            except Exception as exc:
+                return ProbeResult(
+                    target=target,
+                    status="malformed",
+                    error_detail=f"decrypt failed: {type(exc).__name__}",
+                    elapsed_seconds=time.monotonic() - start,
+                )
+            seq += 1
+            if inner_type != _w.RECORD_HANDSHAKE:
+                # Could legitimately be an alert; treat as refusal.
+                if inner_type == _w.RECORD_ALERT:
+                    return ProbeResult(
+                        target=target,
+                        status="refused",
+                        error_detail="server alert in encrypted handshake",
+                        elapsed_seconds=time.monotonic() - start,
+                    )
+                continue
+            hs_reader.feed(plaintext)
+            for msg_type, msg_body, _raw in hs_reader.messages():
+                if msg_type == _w.HS_CERTIFICATE:
+                    cert_info = _w.parse_certificate_message(msg_body, tls13=True)
+                    sig_algo_name = _w.cert_sig_algo_friendly_name(
+                        cert_info.leaf_signature_algorithm_oid
+                    )
+                    return ProbeResult(
+                        target=target,
+                        status="ok",
+                        negotiated_protocol_version=version_str,
+                        cipher_suite=cipher_name,
+                        key_exchange_group=kex_group_name,
+                        signature_algorithm=sig_algo_name,
+                        elapsed_seconds=time.monotonic() - start,
+                    )
+            # else: keep reading more records to find Certificate
+        return ProbeResult(
+            target=target,
+            status="malformed",
+            error_detail="Certificate not seen within record budget",
+            elapsed_seconds=time.monotonic() - start,
+        )
+
+    # ------------------------------------------------------------------
+    # TLS 1.2 path
+    # ------------------------------------------------------------------
+
+    def _finish_tls12(
+        self,
+        *,
+        target: AuditTarget,
+        sock: socket.socket,
+        budget: list[int],
+        start: float,
+        sh_reader: _w.HandshakeReader,
+        info: _w.ServerHelloInfo,
+        version_str: str,
+        cipher_name: str,
+    ) -> ProbeResult:
+        sig_algo_name = ""
+        kex_group_name = ""
+
+        # Process any handshake messages that came in the same record as
+        # SH (rare for real servers, but legal), then keep reading records
+        # until we've seen the leaf Certificate.
+        seen_cert = False
+        for _ in range(64):
+            for msg_type, msg_body, _raw in sh_reader.messages():
+                if msg_type == _w.HS_CERTIFICATE and not seen_cert:
+                    cert_info = _w.parse_certificate_message(msg_body, tls13=False)
+                    sig_algo_name = _w.cert_sig_algo_friendly_name(
+                        cert_info.leaf_signature_algorithm_oid
+                    )
+                    seen_cert = True
+                elif msg_type == _w.HS_SERVER_KEY_EXCHANGE:
+                    curve_id = _w.parse_server_key_exchange_named_curve(msg_body)
+                    if curve_id is not None:
+                        kex_group_name = _w.GROUP_NAMES.get(curve_id, f"group_0x{curve_id:04x}")
+                elif msg_type == _w.HS_SERVER_HELLO_DONE:
+                    return ProbeResult(
+                        target=target,
+                        status="ok",
+                        negotiated_protocol_version=version_str,
+                        cipher_suite=cipher_name,
+                        key_exchange_group=kex_group_name,
+                        signature_algorithm=sig_algo_name,
+                        elapsed_seconds=time.monotonic() - start,
+                    )
+            content_type, _ver, payload = _w.read_record(sock, budget, max_total=MAX_RESPONSE_BYTES)
+            if content_type == _w.RECORD_ALERT:
+                return ProbeResult(
+                    target=target,
+                    status="refused",
+                    error_detail="server alert during TLS 1.2 handshake",
+                    elapsed_seconds=time.monotonic() - start,
+                )
+            if content_type != _w.RECORD_HANDSHAKE:
+                return ProbeResult(
+                    target=target,
+                    status="malformed",
+                    error_detail=(
+                        f"unexpected record content_type={content_type} in TLS 1.2 handshake"
+                    ),
+                    elapsed_seconds=time.monotonic() - start,
+                )
+            sh_reader.feed(payload)
+
+        return ProbeResult(
+            target=target,
+            status="malformed",
+            error_detail="ServerHelloDone not seen within record budget",
+            elapsed_seconds=time.monotonic() - start,
+        )
+
+
+def _format_tls_version(version: int) -> str | None:
+    """Map a 16-bit version code to a stable display string, or None.
+
+    Returns ``None`` for SSLv3 / TLS 1.0 / TLS 1.1: those versions are
+    rejected by Qwashed because their classical KEX/sig surface tells us
+    nothing about modern PQ posture.
+    """
+    if version == _w.TLS_1_3:
+        return "TLSv1.3"
+    if version == _w.TLS_1_2:
+        return "TLSv1.2"
+    return None
 
 
 class SslyzeTlsProbe(Probe):
@@ -364,10 +774,12 @@ def probe_target(
 ) -> ProbeResult:
     """Probe a single target with the given probe implementation.
 
-    If ``probe_impl`` is omitted, defaults to :class:`StdlibTlsProbe` for
-    TLS targets. SSH targets fail immediately with ``ProbeStatus.malformed``
-    (SSH support is deferred to v0.1.1).
+    If ``probe_impl`` is omitted, defaults to :class:`NativeTlsProbe` (the
+    Qwashed v0.2 default). NativeTlsProbe captures full PQ posture
+    (version + cipher + KEX group + signature algorithm) using only stdlib
+    + ``cryptography``. SSH targets fail immediately with
+    ``ProbeStatus.malformed`` (SSH support is deferred to v0.1.1).
     """
     if probe_impl is None:
-        probe_impl = StdlibTlsProbe()
+        probe_impl = NativeTlsProbe()
     return probe_impl.probe(target)

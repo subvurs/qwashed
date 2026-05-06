@@ -124,6 +124,45 @@ The full profile-authoring guide is [`THREAT_PROFILES.md`](THREAT_PROFILES.md).
 
 ---
 
+## Choosing a TLS probe backend
+
+As of v0.2, `qwashed audit` ships three TLS probe implementations.
+The default — `native` — is hand-rolled on top of the always-installed
+`cryptography` core dependency and needs no extras.
+
+```bash
+qwashed audit run targets.yaml --probe native     # default; no extras needed
+qwashed audit run targets.yaml --probe stdlib     # Python `ssl` module
+qwashed audit run targets.yaml --probe sslyze     # sslyze (requires [audit-deep])
+qwashed audit run targets.yaml --probe-timeout 8  # bound the per-handshake clock
+```
+
+| Backend  | Extras needed     | When to use                                                                                       |
+|----------|-------------------|---------------------------------------------------------------------------------------------------|
+| `native` | none (default)    | Air-gapped or minimal installs; civil-society teams who do not want a third-party TLS library.    |
+| `stdlib` | none              | Diagnostic fallback: `ssl`-module path that exercises the OS crypto library Python is linked against. |
+| `sslyze` | `[audit-deep]`    | Deeper enumeration when you also want sslyze's cipher-suite scan surface and JA3 metadata.        |
+
+Install matrix for v0.2:
+
+```bash
+pip install qwashed                  # native TLS probe + no SSH probe
+pip install "qwashed[audit-ssh]"     # adds paramiko for SSH targets
+pip install "qwashed[audit-deep]"    # adds sslyze for the --probe sslyze backend
+pip install "qwashed[audit]"         # meta-extra: deep + ssh (legacy v0.1 alias)
+pip install "qwashed[full]"          # everything: audit + vault + report
+```
+
+The `native` probe issues exactly one ClientHello, reads the
+ServerHello + Certificate (and the AES-GCM-protected
+EncryptedExtensions / Certificate handshake on TLS 1.3), classifies
+the negotiated key-exchange / signature algorithms, and closes the
+connection. It does not enumerate cipher suites, does not retry, and
+does not send anything beyond a single handshake — same posture as
+the v0.1 `stdlib` and `sslyze` paths.
+
+---
+
 ## Reading the report
 
 A finding looks like this in the JSON:

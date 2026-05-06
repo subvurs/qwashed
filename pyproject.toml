@@ -58,10 +58,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# `qwashed audit` (HNDL Auditor) extras
-audit = [
+# `qwashed audit` extras.
+#
+# As of v0.2 the default TLS probe (NativeTlsProbe) is hand-rolled on top
+# of the always-installed `cryptography` core dependency, so a no-extras
+# install can run a full PQ-posture audit out of the box.
+#
+# `audit-deep` adds sslyze for callers who want sslyze's broader scan
+# surface (cipher-suite enumeration, vulnerability scans, JA3 fingerprints,
+# etc.). `audit-ssh` adds paramiko for v0.1.1+ SSH probing. The legacy
+# `audit` alias stays a meta-extra for upgrade compatibility (it pulls
+# both deep + ssh).
+audit-deep = [
     "sslyze>=6.0",
+]
+audit-ssh = [
     "paramiko>=3.4",
+]
+audit = [
+    "qwashed[audit-deep,audit-ssh]",
 ]
 
 # `qwashed vault` (Hybrid PQ Vault) extras

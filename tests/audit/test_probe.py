@@ -22,7 +22,9 @@ from collections.abc import Iterator
 
 import pytest
 
+from qwashed.audit import _tls_wire as _w
 from qwashed.audit.probe import (
+    NativeTlsProbe,
     Probe,
     SslyzeTlsProbe,
     StaticProbe,
@@ -259,3 +261,211 @@ class TestProbeIsAbstract:
     def test_cannot_instantiate(self) -> None:
         with pytest.raises(TypeError):
             Probe()  # type: ignore[abstract]
+
+
+# ---------------------------------------------------------------------------
+# NativeTlsProbe (§3.4: hand-rolled TLS probe, default in v0.2)
+# ---------------------------------------------------------------------------
+
+
+class TestNativeTlsProbe:
+    def test_round_trip_against_loopback(self, loopback_tls_server: int) -> None:
+        target = AuditTarget(host="127.0.0.1", port=loopback_tls_server)
+        probe = NativeTlsProbe(timeout_seconds=5.0)
+        result = probe.probe(target)
+        # Loopback server is a self-signed RSA cert; modern OpenSSL will
+        # negotiate TLS 1.3 with X25519 by default. Either TLS 1.2 or 1.3
+        # is acceptable; both must populate version + cipher + signature.
+        assert result.status == "ok"
+        assert result.negotiated_protocol_version in {"TLSv1.2", "TLSv1.3"}
+        assert result.cipher_suite  # IANA name, non-empty
+        assert result.signature_algorithm  # leaf cert signed sha256WithRSA
+        # If we negotiated TLS 1.3 we must have the KEX group too.
+        if result.negotiated_protocol_version == "TLSv1.3":
+            assert result.key_exchange_group == "X25519"
+        assert result.elapsed_seconds >= 0.0
+        assert result.error_detail == ""
+
+    def test_unreachable_port(self) -> None:
+        target = AuditTarget(host="127.0.0.1", port=1)
+        probe = NativeTlsProbe(timeout_seconds=2.0)
+        result = probe.probe(target)
+        assert result.status in {"refused", "unreachable"}
+        assert result.cipher_suite == ""
+
+    def test_dns_failure(self) -> None:
+        target = AuditTarget(
+            host="this-host-definitely-does-not-exist.qwashed-test.invalid",
+            port=443,
+        )
+        probe = NativeTlsProbe(timeout_seconds=2.0)
+        result = probe.probe(target)
+        assert result.status != "ok"
+        assert result.error_detail
+
+    def test_ssh_target_rejected(self) -> None:
+        target = AuditTarget(host="127.0.0.1", port=22, protocol="ssh")
+        probe = NativeTlsProbe()
+        result = probe.probe(target)
+        assert result.status == "malformed"
+        assert "[audit-ssh]" in result.error_detail
+
+    def test_invalid_timeout_rejected(self) -> None:
+        from qwashed.core.errors import ConfigurationError
+
+        with pytest.raises(ConfigurationError):
+            NativeTlsProbe(timeout_seconds=0)
+        with pytest.raises(ConfigurationError):
+            NativeTlsProbe(timeout_seconds=-1)
+
+    def test_non_tls_garbage_rejected(self) -> None:
+        # Spin up a TCP listener that immediately closes the connection.
+        # That looks like a TLS framing failure.
+        import socket as _socket
+
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+        stop = threading.Event()
+
+        def serve() -> None:
+            sock.settimeout(2.0)
+            try:
+                client, _ = sock.accept()
+                client.close()
+            except (TimeoutError, OSError):
+                pass
+            finally:
+                sock.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            target = AuditTarget(host="127.0.0.1", port=port)
+            probe = NativeTlsProbe(timeout_seconds=2.0)
+            result = probe.probe(target)
+            assert result.status in {"malformed", "refused", "unreachable"}
+            assert result.cipher_suite == ""
+        finally:
+            stop.set()
+            thread.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# Internal TLS wire-format helpers (_tls_wire)
+# ---------------------------------------------------------------------------
+
+
+class TestTlsWireSni:
+    def test_dns_label_accepted(self) -> None:
+        assert _w._is_valid_sni("example.org") is True
+        assert _w._is_valid_sni("a.b.c.example.test") is True
+
+    def test_ipv4_literal_rejected(self) -> None:
+        assert _w._is_valid_sni("127.0.0.1") is False
+        assert _w._is_valid_sni("10.0.0.5") is False
+
+    def test_ipv6_literal_rejected(self) -> None:
+        assert _w._is_valid_sni("::1") is False
+        assert _w._is_valid_sni("2001:db8::1") is False
+
+    def test_empty_rejected(self) -> None:
+        assert _w._is_valid_sni("") is False
+
+    def test_non_ascii_rejected(self) -> None:
+        assert _w._is_valid_sni("xn--bcher-kva.example") is True  # punycode OK
+        assert _w._is_valid_sni("bücher.example") is False  # raw unicode rejected
+
+
+class TestHandshakeReader:
+    def test_single_message(self) -> None:
+        reader = _w.HandshakeReader()
+        body = b"\x01\x02\x03\x04"
+        msg = bytes([_w.HS_SERVER_HELLO]) + len(body).to_bytes(3, "big") + body
+        reader.feed(msg)
+        msgs = reader.messages()
+        assert len(msgs) == 1
+        msg_type, msg_body, raw = msgs[0]
+        assert msg_type == _w.HS_SERVER_HELLO
+        assert msg_body == body
+        assert raw == msg
+
+    def test_fragmented_message_across_feeds(self) -> None:
+        reader = _w.HandshakeReader()
+        body = b"x" * 100
+        msg = bytes([_w.HS_CERTIFICATE]) + len(body).to_bytes(3, "big") + body
+        reader.feed(msg[:30])
+        assert reader.messages() == []
+        reader.feed(msg[30:])
+        msgs = reader.messages()
+        assert len(msgs) == 1
+        assert msgs[0][0] == _w.HS_CERTIFICATE
+        assert msgs[0][1] == body
+
+    def test_multiple_messages_in_one_feed(self) -> None:
+        reader = _w.HandshakeReader()
+        m1 = bytes([_w.HS_ENCRYPTED_EXTENSIONS]) + (0).to_bytes(3, "big")
+        body2 = b"a" * 5
+        m2 = bytes([_w.HS_CERTIFICATE]) + (5).to_bytes(3, "big") + body2
+        reader.feed(m1 + m2)
+        msgs = reader.messages()
+        assert [m[0] for m in msgs] == [_w.HS_ENCRYPTED_EXTENSIONS, _w.HS_CERTIFICATE]
+
+
+class TestParseServerHello:
+    def test_too_short(self) -> None:
+        with pytest.raises(_w.TlsWireError):
+            _w.parse_server_hello(b"\x00" * 10)
+
+
+class TestCertSigAlgoFriendlyName:
+    def test_known_oid(self) -> None:
+        # sha256WithRSAEncryption
+        assert _w.cert_sig_algo_friendly_name("1.2.840.113549.1.1.11") == (
+            "sha256WithRSAEncryption"
+        )
+
+    def test_ed25519(self) -> None:
+        assert _w.cert_sig_algo_friendly_name("1.3.101.112") == "ed25519"
+
+    def test_ml_dsa_65(self) -> None:
+        assert _w.cert_sig_algo_friendly_name("2.16.840.1.101.3.4.3.18") == "id-ml-dsa-65"
+
+    def test_unknown_oid_returns_oid_prefix(self) -> None:
+        assert _w.cert_sig_algo_friendly_name("9.9.9.9") == "oid:9.9.9.9"
+
+
+class TestBuildClientHello:
+    def test_emits_record_with_known_header(self) -> None:
+        material = _w.build_client_hello("example.org")
+        # First byte = handshake record type
+        assert material.record_bytes[0] == _w.RECORD_HANDSHAKE
+        # Bytes 1..3 = legacy_version (TLS 1.2 = 0x0303)
+        assert material.record_bytes[1:3] == b"\x03\x03"
+        # Handshake message starts with HS_CLIENT_HELLO
+        assert material.handshake_message[0] == _w.HS_CLIENT_HELLO
+        # X25519 private key was generated
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+        assert isinstance(material.x25519_priv, X25519PrivateKey)
+
+    def test_omits_sni_for_ip_literal(self) -> None:
+        # SNI extension type 0x0000. If hostname is an IP, SNI must not
+        # appear in the record bytes.
+        material_ip = _w.build_client_hello("127.0.0.1")
+        material_dns = _w.build_client_hello("example.org")
+        # ext_server_name appears as the 2-byte type 0x0000 in the
+        # extensions block. Use a coarse contains check on the record.
+        assert b"\x00\x00\x00" in material_dns.record_bytes  # extension header
+        # IP-literal SNI omission is best verified by handshake size delta:
+        assert len(material_ip.record_bytes) < len(material_dns.record_bytes)
+
+
+class TestProbeTargetDefault:
+    def test_default_is_native(self) -> None:
+        # Empty StaticProbe overrides the default; this just verifies the
+        # default codepath is reachable without raising.
+        target = AuditTarget(host="127.0.0.1", port=1)
+        result = probe_target(target)
+        assert result.status in {"refused", "unreachable"}

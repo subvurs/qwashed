@@ -118,6 +118,12 @@ jobs:
           # failure here surfaces as a job failure rather than a
           # downstream `RuntimeError: No oqs shared libraries found`.
           brew install liboqs
+          # liboqs-python's loader uses ctypes.util.find_library() which
+          # does not probe /opt/homebrew/lib on Apple Silicon runners.
+          # OQS_INSTALL_PATH points the loader at $PATH/lib explicitly.
+          # Persist via $GITHUB_ENV so subsequent steps (pip install,
+          # pytest) see it.
+          echo "OQS_INSTALL_PATH=/opt/homebrew" >> "$GITHUB_ENV"
 
       - name: Install Qwashed with full extras
         run: |

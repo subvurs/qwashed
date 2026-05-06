@@ -65,9 +65,7 @@ __all__ = [
 ]
 
 #: All operations the vault may record.
-OPS: Final[frozenset[str]] = frozenset(
-    {"init", "put", "get", "delete", "export", "upgrade"}
-)
+OPS: Final[frozenset[str]] = frozenset({"init", "put", "get", "delete", "export", "upgrade"})
 
 #: Sentinel ``prev_hash`` for the genesis line.
 GENESIS_PREV_HASH: Final[str] = "0" * 64

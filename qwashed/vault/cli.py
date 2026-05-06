@@ -316,11 +316,9 @@ def _vault_upgrade(args: argparse.Namespace) -> int:
         return 2
 
     sys.stdout.write(
-        (
-            f"qwashed vault upgrade: {len(report.upgraded)} upgraded, "
-            f"{len(report.already_current)} already at v{report.target_format_version} "
-            f"({vault.root})\n"
-        )
+        f"qwashed vault upgrade: {len(report.upgraded)} upgraded, "
+        f"{len(report.already_current)} already at v{report.target_format_version} "
+        f"({vault.root})\n"
     )
     for ulid in report.upgraded:
         sys.stdout.write(f"  upgraded\t{ulid}\n")

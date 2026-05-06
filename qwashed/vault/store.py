@@ -147,9 +147,9 @@ __all__ = [
     "EXPORT_SIG_DOMAIN",
     "EXPORT_VERSION",
     "FILE_MODE",
+    "FORMAT_VERSION_CURRENT",
     "FORMAT_VERSION_V01",
     "FORMAT_VERSION_V02",
-    "FORMAT_VERSION_CURRENT",
     "IDENTITY_VERSION",
     "MANIFEST_VERSION",
     "META_VERSION",
@@ -218,12 +218,8 @@ BLOB_VERSION: Final[int] = BLOB_VERSION_V02
 ENTRY_NONCE_LEN: Final[int] = 12
 
 #: HKDF info strings for entry AEAD key derivation, per format version.
-ENTRY_AEAD_INFO_V01: Final[bytes] = info_for(
-    module="vault", purpose="entry-aead", version="v0.1"
-)
-ENTRY_AEAD_INFO_V02: Final[bytes] = info_for(
-    module="vault", purpose="entry-aead", version="v0.2"
-)
+ENTRY_AEAD_INFO_V01: Final[bytes] = info_for(module="vault", purpose="entry-aead", version="v0.1")
+ENTRY_AEAD_INFO_V02: Final[bytes] = info_for(module="vault", purpose="entry-aead", version="v0.2")
 
 #: Backwards-compatible alias (v0.1 callers).
 ENTRY_AEAD_INFO: Final[bytes] = ENTRY_AEAD_INFO_V01
@@ -246,6 +242,7 @@ def _entry_aead_info_for(format_version: int) -> bytes:
         f"unsupported entry AEAD format_version: {format_version}",
         error_code="vault.store.bad_aead_format_version",
     )
+
 
 #: Maximum sane KEM-ciphertext length we will accept when parsing a blob.
 _MAX_KEM_CT_LEN: Final[int] = 1 << 16  # 64 KiB; FIPS 203 ML-KEM-768 ct is 1088 bytes.
@@ -1032,12 +1029,7 @@ def _seal_blob(
     nonce = secrets.token_bytes(ENTRY_NONCE_LEN)
     aead = AESGCM(aead_key)
     aead_blob = aead.encrypt(nonce, plaintext, ulid.encode("ascii"))
-    header = (
-        BLOB_MAGIC
-        + bytes([format_version])
-        + b"\x00\x00\x00"
-        + struct.pack(">I", len(kem_ct))
-    )
+    header = BLOB_MAGIC + bytes([format_version]) + b"\x00\x00\x00" + struct.pack(">I", len(kem_ct))
     return header + kem_ct + nonce + aead_blob
 
 
@@ -1792,10 +1784,7 @@ class Vault:
         # identity is preserved across the upgrade. Skip if already at
         # target format and no entries were upgraded — the file is
         # already byte-identical to what we'd write.
-        if (
-            self._manifest.format_version != target_format_version
-            or upgraded
-        ):
+        if self._manifest.format_version != target_format_version or upgraded:
             new_manifest = _sign_manifest(
                 vault_id=self._manifest.vault_id,
                 created_at=self._manifest.created_at,

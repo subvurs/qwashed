@@ -94,15 +94,30 @@ jobs:
       - name: System deps (liboqs on Linux)
         if: runner.os == 'Linux'
         run: |
-          # liboqs-python wheel covers most Linux x86_64 cases. Install
-          # the C library as a fallback in case the wheel build fails.
+          # liboqs-python is a thin ctypes wrapper around the upstream
+          # liboqs C library — it does NOT bundle liboqs.so. Ubuntu does
+          # not ship liboqs in its main repos either, so we build from
+          # source. Pin to a stable upstream tag so CI is deterministic.
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev || true
+          sudo apt-get install -y cmake ninja-build libssl-dev git
+          git clone --depth 1 --branch 0.14.0 https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs
+          cmake -GNinja -S /tmp/liboqs -B /tmp/liboqs/build \
+            -DBUILD_SHARED_LIBS=ON \
+            -DOQS_BUILD_ONLY_LIB=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/liboqs/build --parallel
+          sudo cmake --install /tmp/liboqs/build
+          sudo ldconfig
 
       - name: System deps (liboqs on macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install liboqs || true
+          # Homebrew ships liboqs as a first-class formula on macos-14
+          # (Apple Silicon). `brew install` is idempotent on the cached
+          # toolchain image; do not silence its exit code so a real
+          # failure here surfaces as a job failure rather than a
+          # downstream `RuntimeError: No oqs shared libraries found`.
+          brew install liboqs
 
       - name: Install Qwashed with full extras
         run: |

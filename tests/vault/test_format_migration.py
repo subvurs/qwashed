@@ -172,9 +172,7 @@ class TestV01ReadableByV02Reader:
 
     def test_v01_entry_round_trip_via_v02_reader(self, fresh_vault: Vault) -> None:
         meta = fresh_vault.put(b"plaintext-payload", name="x")
-        _downgrade_entry_to_v01(
-            fresh_vault, meta.ulid, b"plaintext-payload", name="x"
-        )
+        _downgrade_entry_to_v01(fresh_vault, meta.ulid, b"plaintext-payload", name="x")
         # Re-open the vault from disk to ensure no in-memory state
         # leaks the v0.2 view.
         v = unlock_vault(fresh_vault.root, _PASSPHRASE)
@@ -224,9 +222,7 @@ class TestUpgrade:
         doc = json.loads(_manifest_path(v.root).read_text("utf-8"))
         assert doc["format_version"] == FORMAT_VERSION_V02
 
-    def test_upgrade_preserves_plaintext_byte_for_byte(
-        self, fresh_vault: Vault
-    ) -> None:
+    def test_upgrade_preserves_plaintext_byte_for_byte(self, fresh_vault: Vault) -> None:
         payload = b"\x00\x01\x02\xff\xfe\xfd binary safe payload"
         meta = fresh_vault.put(payload, name="bin")
         _downgrade_entry_to_v01(fresh_vault, meta.ulid, payload, name="bin")
@@ -257,9 +253,7 @@ class TestUpgrade:
         assert second.upgraded == ()
         assert second.already_current == (meta.ulid,)
 
-    def test_upgrade_appends_one_audit_line_per_entry(
-        self, fresh_vault: Vault
-    ) -> None:
+    def test_upgrade_appends_one_audit_line_per_entry(self, fresh_vault: Vault) -> None:
         ulids = []
         for i in range(2):
             payload = f"u{i}".encode()
@@ -274,9 +268,7 @@ class TestUpgrade:
         upgrade_subjects = [e.subject for e in entries if e.op == "upgrade"]
         assert sorted(upgrade_subjects) == sorted(ulids)
 
-    def test_upgrade_preserves_original_put_lines(
-        self, fresh_vault: Vault
-    ) -> None:
+    def test_upgrade_preserves_original_put_lines(self, fresh_vault: Vault) -> None:
         meta = fresh_vault.put(b"original", name="o")
         _downgrade_entry_to_v01(fresh_vault, meta.ulid, b"original", name="o")
 
@@ -291,9 +283,7 @@ class TestUpgrade:
         # to an on-disk entry (now v0.2).
         v.verify()
 
-    def test_upgrade_on_already_current_vault_is_noop(
-        self, fresh_vault: Vault
-    ) -> None:
+    def test_upgrade_on_already_current_vault_is_noop(self, fresh_vault: Vault) -> None:
         # Brand-new vault is already at v0.2.
         for i in range(2):
             fresh_vault.put(f"x{i}".encode(), name=f"x{i}")
@@ -344,9 +334,7 @@ class TestMixedFormatVault:
 
 
 class TestNoPlaintextSpill:
-    def test_distinctive_plaintext_never_appears_on_disk(
-        self, tmp_path: Path
-    ) -> None:
+    def test_distinctive_plaintext_never_appears_on_disk(self, tmp_path: Path) -> None:
         # Use a marker that should be impossible to find by chance.
         marker = b"QWASHED_TEST_PLAINTEXT_MARKER_8c14f7d2_"
         plaintext = marker + b"-payload-body"
@@ -378,9 +366,7 @@ class TestDefenses:
         with pytest.raises(Exception):  # SchemaValidationError
             v.upgrade(target_format_version=99)
 
-    def test_upgrade_rejects_format_mismatch_meta_vs_blob(
-        self, fresh_vault: Vault
-    ) -> None:
+    def test_upgrade_rejects_format_mismatch_meta_vs_blob(self, fresh_vault: Vault) -> None:
         # Forge a mismatch in the upgrade direction: blob byte is v0.1
         # but the signed metadata claims v0.2. upgrade() must refuse to
         # silently re-encrypt under a contradictory contract.

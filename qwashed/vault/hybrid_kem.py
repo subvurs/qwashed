@@ -136,6 +136,7 @@ def kem_info_for_format(format_version: int) -> bytes:
         error_code="vault.kem.bad_format_version",
     )
 
+
 #: Maximum sane component length used for malformed-input rejection.
 _MAX_COMPONENT_LEN: Final[int] = 1 << 20  # 1 MiB; far above any FIPS sizes.
 

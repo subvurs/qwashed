@@ -29,6 +29,6 @@ __all__ = [
     "__version__",
 ]
 
-__version__: str = "0.1.0"
+__version__: str = "0.2.0a1"
 __author__: str = "Mark Eatherly"
 __license__: str = "Apache-2.0"

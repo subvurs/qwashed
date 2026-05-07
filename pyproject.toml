@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "qwashed"
-version = "0.1.0"
+version = "0.2.0a1"
 description = "Free post-quantum hygiene for civil society: HNDL audit + hybrid-PQ vault."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -113,12 +113,14 @@ dev = [
 qwashed = "qwashed.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/qwashed/qwashed"
-Documentation = "https://github.com/qwashed/qwashed/blob/main/docs/QUICKSTART.md"
-Repository = "https://github.com/qwashed/qwashed"
-Issues = "https://github.com/qwashed/qwashed/issues"
-"Threat Model" = "https://github.com/qwashed/qwashed/blob/main/THREAT_MODEL.md"
-"Build Plan" = "https://github.com/qwashed/qwashed/blob/main/QWASHED_BUILD_PLAN.txt"
+Homepage = "https://github.com/Subvurs/qwashed"
+Documentation = "https://github.com/Subvurs/qwashed/blob/main/docs/QUICKSTART.md"
+Repository = "https://github.com/Subvurs/qwashed"
+Issues = "https://github.com/Subvurs/qwashed/issues"
+Changelog = "https://github.com/Subvurs/qwashed/blob/main/CHANGELOG.md"
+"Threat Model" = "https://github.com/Subvurs/qwashed/blob/main/THREAT_MODEL.md"
+"Audit Guide" = "https://github.com/Subvurs/qwashed/blob/main/docs/AUDIT_GUIDE.md"
+"Roadmap" = "https://github.com/Subvurs/qwashed/blob/main/docs/ROADMAP.md"
 
 # ---------------------------------------------------------------------------
 # Hatch build configuration

@@ -7,13 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-v0.2 development is underway. ROADMAP §3.6 (vault format v0.2 migration
-path) landed 2026-05-05; ROADMAP §3.4 (hand-rolled `NativeTlsProbe`,
-sslyze becomes opt-in via `[audit-deep]`) landed 2026-05-06; ROADMAP
-§3.2 (Email PGP / S/MIME audit probe) landed 2026-05-06; ROADMAP §3.5
-(richer HNDL scoring) landed 2026-05-06; remaining v0.2 work items
-(§3.1, §3.3, §3.7–3.9) are pending. v0.2 readers continue to read v0.1
-entries through the v0.4 deprecation window per `THREAT_MODEL.md`
+Stabilization line for the eventual v0.2.0 release. Tracks the remaining
+v0.2 ROADMAP work items (§3.1 hybrid release signing, §3.3 WG/IPsec,
+§3.7 GPG key, §3.8 benchmarks, §3.9 mesh profile).
+
+## [0.2.0a1] — 2026-05-06
+
+First v0.2 alpha. Mid-cycle pre-release that bundles every v0.2 ROADMAP
+item that has landed so far, so users can install + smoke-test the new
+audit probes and scoring on TestPyPI before the full v0.2.0. Versioned
+as a PEP 440 alpha (`0.2.0a1`); `pip install qwashed` continues to
+return v0.1.0 until v0.2.0 ships, but `pip install --pre qwashed` (or
+`qwashed==0.2.0a1`) gets this preview.
+
+ROADMAP §3.6 (vault format v0.2 migration path) landed 2026-05-05;
+ROADMAP §3.4 (hand-rolled `NativeTlsProbe`, sslyze becomes opt-in via
+`[audit-deep]`) landed 2026-05-06; ROADMAP §3.2 (Email PGP / S/MIME
+audit probe) landed 2026-05-06; ROADMAP §3.5 (richer HNDL scoring)
+landed 2026-05-06. v0.2 readers continue to read v0.1 vault entries
+through the v0.4 deprecation window per `THREAT_MODEL.md`
 §"Versioning and forward compatibility".
 
 ### Added

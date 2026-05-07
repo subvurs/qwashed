@@ -25,6 +25,24 @@ def _ssh_target() -> AuditTarget:
     return AuditTarget(host="x.example", port=22, protocol="ssh")
 
 
+def _pgp_target() -> AuditTarget:
+    return AuditTarget(  # type: ignore[arg-type]
+        host="alice@example.org",
+        port=0,
+        protocol="pgp",
+        key_path="/tmp/dummy.asc",
+    )
+
+
+def _smime_target() -> AuditTarget:
+    return AuditTarget(  # type: ignore[arg-type]
+        host="alice@example.org",
+        port=0,
+        protocol="smime",
+        key_path="/tmp/dummy.pem",
+    )
+
+
 def _probe_ok(
     target: AuditTarget,
     *,
@@ -72,6 +90,25 @@ class TestAlgorithmTables:
         assert t.classify_ssh_kex("curve25519-sha256") == "classical"
         assert t.classify_ssh_kex("sntrup761x25519-sha512") == "hybrid_pq"
         assert t.classify_ssh_hostkey("ssh-ed25519") == "classical"
+
+    def test_pgp_public_key(self) -> None:
+        t = load_algorithm_tables()
+        assert t.classify_pgp_public_key("rsa_2048") == "classical"
+        assert t.classify_pgp_public_key("ed25519") == "classical"
+        assert t.classify_pgp_public_key("garbage_algo") == "unknown"
+
+    def test_smime_public_key(self) -> None:
+        t = load_algorithm_tables()
+        assert t.classify_smime_public_key("rsa_2048") == "classical"
+        assert t.classify_smime_public_key("ecdsa_p256") == "classical"
+        assert t.classify_smime_public_key("garbage_algo") == "unknown"
+
+    def test_smime_signature(self) -> None:
+        t = load_algorithm_tables()
+        assert t.classify_smime_signature("sha256_with_rsa") == "classical"
+        assert t.classify_smime_signature("ecdsa_with_sha256") == "classical"
+        assert t.classify_smime_signature("ed25519") == "classical"
+        assert t.classify_smime_signature("garbage_sig") == "unknown"
 
 
 class TestClassifyAlgorithm:
@@ -177,6 +214,61 @@ class TestClassify:
             )
         )
         assert finding.category == "hybrid_pq"
+
+    def test_pgp_classical_rsa(self) -> None:
+        # PgpProbe stuffs the primary key algorithm wire-name into
+        # signature_algorithm; the classifier reads it from there.
+        finding = classify(_probe_ok(_pgp_target(), sig="rsa_2048"))
+        assert finding.category == "classical"
+
+    def test_pgp_classical_ed25519(self) -> None:
+        finding = classify(_probe_ok(_pgp_target(), sig="ed25519"))
+        assert finding.category == "classical"
+
+    def test_pgp_unknown(self) -> None:
+        finding = classify(_probe_ok(_pgp_target(), sig="alien_pgp_algo"))
+        assert finding.category == "unknown"
+
+    def test_smime_classical_rsa_chain(self) -> None:
+        finding = classify(
+            _probe_ok(
+                _smime_target(),
+                kex="rsa_2048",
+                sig="sha256_with_rsa",
+            )
+        )
+        assert finding.category == "classical"
+
+    def test_smime_classical_ed25519_leaf_under_rsa_issuer(self) -> None:
+        # Hybrid-of-classicals; both legs are classical → classical.
+        finding = classify(
+            _probe_ok(
+                _smime_target(),
+                kex="ed25519",
+                sig="sha256_with_rsa",
+            )
+        )
+        assert finding.category == "classical"
+
+    def test_smime_unknown_pubkey(self) -> None:
+        finding = classify(
+            _probe_ok(
+                _smime_target(),
+                kex="alien_pubkey",
+                sig="sha256_with_rsa",
+            )
+        )
+        assert finding.category == "unknown"
+
+    def test_smime_unknown_sig(self) -> None:
+        finding = classify(
+            _probe_ok(
+                _smime_target(),
+                kex="rsa_2048",
+                sig="alien_signature",
+            )
+        )
+        assert finding.category == "unknown"
 
 
 class TestPropertyBasedFailClosed:

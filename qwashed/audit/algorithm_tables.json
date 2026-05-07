@@ -132,5 +132,129 @@
       "ssh-mldsa65",
       "ssh-mldsa87"
     ]
+  },
+  "pgp_public_key_algorithms": {
+    "classical": [
+      "rsa_1024",
+      "rsa_2048",
+      "rsa_3072",
+      "rsa_4096",
+      "rsa_8192",
+      "rsa_encrypt_only_2048",
+      "rsa_sign_only_2048",
+      "dsa_1024",
+      "dsa_2048",
+      "dsa_3072",
+      "elgamal_2048",
+      "elgamal_3072",
+      "ecdsa_nistp256",
+      "ecdsa_nistp384",
+      "ecdsa_nistp521",
+      "ecdsa_brainpoolp256r1",
+      "ecdsa_brainpoolp384r1",
+      "ecdsa_brainpoolp512r1",
+      "ecdh_curve25519",
+      "ecdh_curve448",
+      "ecdh_nistp256",
+      "ecdh_nistp384",
+      "ecdh_nistp521",
+      "ecdh_brainpoolp256r1",
+      "ecdh_brainpoolp384r1",
+      "ecdh_brainpoolp512r1",
+      "eddsa_curve25519",
+      "eddsa_curve448",
+      "ed25519",
+      "ed448",
+      "x25519",
+      "x448"
+    ],
+    "hybrid_pq": [
+      "ed25519_mldsa65",
+      "ed448_mldsa87",
+      "x25519_mlkem768",
+      "x448_mlkem1024"
+    ],
+    "pq_only": [
+      "mldsa44",
+      "mldsa65",
+      "mldsa87",
+      "mlkem512",
+      "mlkem768",
+      "mlkem1024",
+      "slhdsa_sha2_128s",
+      "slhdsa_sha2_192s",
+      "slhdsa_sha2_256s"
+    ]
+  },
+  "smime_public_key_algorithms": {
+    "classical": [
+      "rsa_1024",
+      "rsa_2048",
+      "rsa_3072",
+      "rsa_4096",
+      "rsa_8192",
+      "ecdsa_p256",
+      "ecdsa_p384",
+      "ecdsa_p521",
+      "ecdsa_brainpoolp256r1",
+      "ecdsa_brainpoolp384r1",
+      "ecdsa_brainpoolp512r1",
+      "ed25519",
+      "ed448",
+      "x25519",
+      "x448",
+      "dsa_1024",
+      "dsa_2048",
+      "dsa_3072"
+    ],
+    "hybrid_pq": [
+      "rsa_pss_mldsa65",
+      "ecdsa_p256_mldsa65",
+      "ed25519_mldsa65",
+      "ed448_mldsa87"
+    ],
+    "pq_only": [
+      "mldsa44",
+      "mldsa65",
+      "mldsa87",
+      "slhdsa_sha2_128s",
+      "slhdsa_sha2_192s",
+      "slhdsa_sha2_256s",
+      "falcon_512",
+      "falcon_1024"
+    ]
+  },
+  "smime_signature_algorithms": {
+    "classical": [
+      "sha256_with_rsa",
+      "sha384_with_rsa",
+      "sha512_with_rsa",
+      "rsa_pss_sha256",
+      "rsa_pss_sha384",
+      "rsa_pss_sha512",
+      "ecdsa_with_sha256",
+      "ecdsa_with_sha384",
+      "ecdsa_with_sha512",
+      "ed25519",
+      "ed448",
+      "sha256_with_dsa",
+      "sha1_with_rsa",
+      "sha1_with_ecdsa"
+    ],
+    "hybrid_pq": [
+      "ed25519_mldsa65",
+      "rsa_pss_mldsa65",
+      "ecdsa_p256_mldsa65"
+    ],
+    "pq_only": [
+      "mldsa44",
+      "mldsa65",
+      "mldsa87",
+      "slhdsa_sha2_128s",
+      "slhdsa_sha2_192s",
+      "slhdsa_sha2_256s",
+      "falcon_512",
+      "falcon_1024"
+    ]
   }
 }

@@ -18,6 +18,12 @@ Decision rule (highest priority wins):
 5. If KEX group is classical AND signature is classical: category = "classical".
 6. Otherwise (anything unrecognized): category = "unknown".
 
+For PGP targets, the only field that matters is the primary public-key
+algorithm; the classifier looks it up in ``pgp_public_key_algorithms``
+and returns that category directly. For S/MIME targets, the cert's
+SubjectPublicKeyInfo algorithm and signature algorithm are combined via
+the same _combine() decision table as TLS / SSH KEX vs signature.
+
 The rationale string captured on the resulting :class:`AuditFinding` records
 *which* algorithm drove the decision, so a human reviewer can audit it.
 """
@@ -56,6 +62,9 @@ class AlgorithmTables:
     """
 
     __slots__ = (
+        "_pgp_public_key",
+        "_smime_public_key",
+        "_smime_signature",
         "_ssh_hostkey",
         "_ssh_kex",
         "_tls_cipher",
@@ -69,6 +78,15 @@ class AlgorithmTables:
         self._tls_cipher = self._index(raw.get("tls_cipher_suites", {}), lower=False)
         self._ssh_kex = self._index(raw.get("ssh_key_exchange", {}), lower=True)
         self._ssh_hostkey = self._index(raw.get("ssh_host_key_algorithms", {}), lower=True)
+        self._pgp_public_key = self._index(
+            raw.get("pgp_public_key_algorithms", {}), lower=True,
+        )
+        self._smime_public_key = self._index(
+            raw.get("smime_public_key_algorithms", {}), lower=True,
+        )
+        self._smime_signature = self._index(
+            raw.get("smime_signature_algorithms", {}), lower=True,
+        )
 
     @staticmethod
     def _index(
@@ -103,6 +121,15 @@ class AlgorithmTables:
 
     def classify_ssh_hostkey(self, name: str) -> Category:
         return self._ssh_hostkey.get(name.strip().lower(), "unknown")
+
+    def classify_pgp_public_key(self, name: str) -> Category:
+        return self._pgp_public_key.get(name.strip().lower(), "unknown")
+
+    def classify_smime_public_key(self, name: str) -> Category:
+        return self._smime_public_key.get(name.strip().lower(), "unknown")
+
+    def classify_smime_signature(self, name: str) -> Category:
+        return self._smime_signature.get(name.strip().lower(), "unknown")
 
 
 @lru_cache(maxsize=1)
@@ -151,10 +178,12 @@ def classify_algorithm(
     Parameters
     ----------
     protocol:
-        ``"tls"`` or ``"ssh"``.
+        ``"tls"``, ``"ssh"``, ``"pgp"``, or ``"smime"``.
     field:
         For TLS: ``"kex"``, ``"signature"``, or ``"cipher"``.
         For SSH: ``"kex"`` or ``"hostkey"``.
+        For PGP: ``"public_key"``.
+        For S/MIME: ``"public_key"`` or ``"signature"``.
     name:
         The wire-name of the algorithm.
     tables:
@@ -182,6 +211,14 @@ def classify_algorithm(
             return t.classify_ssh_kex(name)
         if field == "hostkey":
             return t.classify_ssh_hostkey(name)
+    elif protocol == "pgp":
+        if field == "public_key":
+            return t.classify_pgp_public_key(name)
+    elif protocol == "smime":
+        if field == "public_key":
+            return t.classify_smime_public_key(name)
+        if field == "signature":
+            return t.classify_smime_signature(name)
     raise ConfigurationError(
         f"unknown protocol/field combination: {protocol!r}/{field!r}",
         error_code="audit.classifier.bad_field",
@@ -236,6 +273,28 @@ def classify(
         rationale = (
             f"SSH kex={probe.key_exchange_group!r} ({kex_cat}); "
             f"hostkey={probe.signature_algorithm!r} ({sig_cat}) -> {category}"
+        )
+    elif proto == "pgp":
+        # PgpProbe stashes the primary public-key algorithm wire-name in
+        # ProbeResult.signature_algorithm (the field is repurposed for
+        # the algorithm being classified across protocols).
+        pk_cat = t.classify_pgp_public_key(probe.signature_algorithm)
+        category = pk_cat
+        rationale = (
+            f"PGP primary public-key algorithm="
+            f"{probe.signature_algorithm!r} ({pk_cat}) -> {category}"
+        )
+    elif proto == "smime":
+        # SmimeProbe stashes the SubjectPublicKeyInfo algorithm in
+        # ProbeResult.key_exchange_group and the cert's signatureAlgorithm
+        # in ProbeResult.signature_algorithm.
+        pk_cat = t.classify_smime_public_key(probe.key_exchange_group)
+        sig_cat = t.classify_smime_signature(probe.signature_algorithm)
+        category = _combine(pk_cat, sig_cat)
+        rationale = (
+            f"S/MIME public_key={probe.key_exchange_group!r} ({pk_cat}); "
+            f"signature={probe.signature_algorithm!r} ({sig_cat}) -> "
+            f"{category}"
         )
     else:  # pragma: no cover - schema rejects this earlier
         raise ConfigurationError(

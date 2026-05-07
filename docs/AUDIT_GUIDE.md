@@ -213,6 +213,76 @@ information.
 
 ---
 
+## Reading the score (v0.2)
+
+v0.2 (ROADMAP §3.5) extends `score_finding` with a small, **bounded**
+catalog of HNDL boosts. The base v0.1 category score (`classical` /
+`hybrid_pq` / `pq_only` / `unknown` × profile weight) still does the
+heavy lifting; the boosts only raise the score when the probe surfaces
+specific HNDL-relevant facts.
+
+### Boost catalog
+
+| Trigger                                              | Boost  | Rationale                                                  |
+|------------------------------------------------------|--------|------------------------------------------------------------|
+| RSA public key < `rsa_minimum` (default 2048 bit)    | +0.10  | Weak RSA accelerates HNDL: shorter keys fall first.         |
+| RSA public key < `rsa_strong` (default 3072 bit)     | +0.05  | Below the strong-RSA threshold; CRQC margin is thinner.     |
+| ECC public key < `ecc_minimum` (default 224 bit)     | +0.05  | Weak EC keys; same HNDL acceleration argument.              |
+| Cert `not_after` past `cert_lifetime_horizon` (default 2030-01-01) | +0.05 | Long-lived cert = more harvested traffic to decrypt later. |
+| TLS cipher is non-AEAD (CBC-mode etc.)               | +0.05  | AEAD is the v0.2 baseline; CBC is a downgrade hint.         |
+
+**Bounds:**
+
+- Each individual boost is capped at **+0.10**.
+- The total v0.2 contribution to a single finding is capped at **+0.20**.
+  When the unclamped sum exceeds the total cap, the contributions are
+  scaled proportionally so each rationale line stays ≤ its declared
+  weight.
+- The final score is then clamped to `[0.0, 1.0]`.
+
+A v0.1 fixture that exposes none of these signals (e.g., the
+`hybrid_pq` golden with Ed25519 + AEAD + far-future cert) gets the
+same score it got in v0.1 — the v0.2 path is purely additive.
+
+### Per-finding `--explain` flag
+
+```bash
+qwashed audit run targets.yaml --profile journalism -o report.json --explain
+```
+
+`--explain` prints a per-finding boost breakdown to stderr after the
+report renders, e.g.:
+
+```
+# qwashed audit: per-finding boost breakdown (v0.2)
+
+mail-frontend (mail.example-lawfirm.org:443)
+  category=classical base=0.900 boost=+0.050 final=0.950 severity=critical
+    +0.050  RSA-2048 below rsa_strong (3072)
+```
+
+The lines are read directly off `score_finding`'s rationale, so
+`--explain` cannot drift from the actual scoring logic.
+
+### Threat-profile overrides
+
+Profile YAML may set:
+
+```yaml
+key_length_thresholds:
+  rsa_minimum: 3072        # default 2048
+  rsa_strong:  4096        # default 3072
+  ecc_minimum: 256         # default 224
+cert_lifetime_horizon: "2028-01-01"   # default 2030-01-01
+enable_v02_scoring: true               # default true
+```
+
+`enable_v02_scoring: false` reproduces v0.1 scores byte-identically —
+the opt-out for v0.1-pinned evidence chains. All keys are optional;
+omitting them keeps the v0.2 defaults.
+
+---
+
 ## Exit codes
 
 | Code | Meaning                                                                  |
@@ -239,9 +309,10 @@ Each target has:
 
 | Field      | Required? | Type   | Default | Notes                                     |
 |------------|-----------|--------|---------|-------------------------------------------|
-| `host`     | yes       | string |         | DNS name or IPv4 / IPv6 literal           |
-| `port`     | yes       | int    |         | TCP port                                  |
-| `protocol` | no        | enum   | `tls`   | `tls` (v0.1) or `ssh` (deferred to v0.1.1) |
+| `host`     | yes       | string |         | DNS name / IPv4 / IPv6 literal for network probes; for file-only protocols (PGP, S/MIME) the key owner's email or label |
+| `port`     | yes       | int    |         | TCP port for network probes; `0` for file-only protocols |
+| `protocol` | no        | enum   | `tls`   | `tls`, `ssh` (v0.1.x), `pgp`, `smime` (v0.2 in development) |
+| `key_path` | conditional | string |       | Required for `pgp` and `smime`; relative paths resolve against the config file's directory |
 | `label`    | no        | string |         | Human-readable label that appears in the report |
 
 Example:
@@ -260,13 +331,19 @@ targets:
     label: bastion
 ```
 
-> **SSH probing is deferred to v0.1.1.** Listing an `ssh` target in
-> v0.1 produces a finding with `status: probe_unsupported` and is
-> scored under the `unknown` category. Plan ahead: the protocol-level
-> migration story for SSH is more fragmented than TLS in v0.1's
-> shipping window, and probing an outdated `OpenSSH` banner that does
-> not yet announce hybrid host-key options would have produced
-> low-confidence findings.
+> **SSH probing landed in v0.1.1** (ROADMAP §3.4). `ssh` targets are
+> probed natively (host-key algorithm + KEX banner) and classified
+> under the same HNDL framework as TLS.
+>
+> **PGP and S/MIME probing are in development for v0.2** (ROADMAP §3.2).
+> `pgp` targets accept an OpenPGP keyring file (binary or ASCII-armored)
+> and classify the primary key + first encryption subkey. `smime`
+> targets accept an X.509 certificate (PEM or DER) and classify the
+> public-key algorithm + signature algorithm. Both are file-only:
+> Qwashed never reaches into HSMs, mobile keychains, or remote
+> keyservers in v0.2; supply the key file yourself. See
+> `examples/audit/email_pgp.yaml` and `examples/audit/email_smime.yaml`
+> for templates.
 
 The four bundled examples in `examples/audit/` are valid starting
 points:
@@ -546,4 +623,4 @@ for end-to-end provenance.
 
 ---
 
-*Last updated: 2026-04-30 (v0.1.0 release).*
+*Last updated: 2026-05-06 (v0.2 §3.5 richer HNDL scoring landed).*

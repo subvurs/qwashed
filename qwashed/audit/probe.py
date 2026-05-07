@@ -47,23 +47,30 @@ import hashlib
 import socket
 import ssl
 import time
-from abc import ABC, abstractmethod
 from typing import Any, Final
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
 from qwashed.audit import _tls_wire as _w
-from qwashed.audit.schemas import AuditTarget, ProbeResult
+from qwashed.audit.probe_base import Probe
+from qwashed.audit.probe_pgp import PgpProbe
+from qwashed.audit.probe_smime import SmimeProbe
+from qwashed.audit.schemas import FILE_ONLY_PROTOCOLS, AuditTarget, ProbeResult
 from qwashed.core.errors import ConfigurationError
 
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
+    "FILE_ONLY_PROTOCOLS",
     "MAX_RESPONSE_BYTES",
+    "MultiplexProbe",
     "NativeTlsProbe",
+    "PgpProbe",
     "Probe",
+    "SmimeProbe",
     "SslyzeTlsProbe",
     "StaticProbe",
     "StdlibTlsProbe",
+    "build_default_probe",
     "probe_target",
 ]
 
@@ -74,22 +81,6 @@ DEFAULT_TIMEOUT_SECONDS: Final[float] = 10.0
 #: ssl module reads handshake records as needed; we set the socket option
 #: to cap. A normal TLS 1.3 handshake is ~5-7 KB.
 MAX_RESPONSE_BYTES: Final[int] = 65536
-
-
-class Probe(ABC):
-    """Abstract probe interface.
-
-    Implementations MUST:
-
-    * Return a :class:`ProbeResult` with the same target.
-    * Return ``status="unreachable"`` on connect timeout / DNS failure.
-    * Return ``status="refused"`` on TCP RST / TLS alert.
-    * Return ``status="malformed"`` on protocol-framing errors.
-    * Never raise on a network error.
-    """
-
-    @abstractmethod
-    def probe(self, target: AuditTarget) -> ProbeResult: ...
 
 
 class StdlibTlsProbe(Probe):
@@ -153,6 +144,9 @@ class StdlibTlsProbe(Probe):
                     # stdlib does not expose negotiated group / sig
                     key_exchange_group="",
                     signature_algorithm="",
+                    aead=_classify_tls_aead(
+                        version_str=version, cipher_name=cipher_name
+                    ),
                     elapsed_seconds=elapsed,
                 )
         except TimeoutError as exc:
@@ -192,6 +186,33 @@ def _is_refused(exc: BaseException) -> bool:
     """Heuristic: does this OSError look like an active refusal?"""
     msg = str(exc).lower()
     return "refused" in msg or "reset" in msg or "connection aborted" in msg
+
+
+def _classify_tls_aead(*, version_str: str, cipher_name: str) -> bool | None:
+    """Return whether the negotiated TLS cipher is an AEAD construction.
+
+    * TLS 1.3 ciphers are always AEAD by construction (RFC 8446 §5.2).
+    * TLS 1.2 AEAD suites contain ``GCM``, ``CHACHA20``, or ``CCM``.
+    * TLS 1.2 CBC suites are non-AEAD.
+    * Other / unrecognised cipher names return ``None`` (unknown).
+
+    Used by :class:`NativeTlsProbe` and :class:`StdlibTlsProbe` to
+    populate :attr:`ProbeResult.aead`, which feeds the v0.2 (§3.5)
+    non-AEAD scoring boost.
+    """
+    if not cipher_name or not version_str:
+        return None
+    if version_str == "TLSv1.3":
+        return True
+    if version_str in {"TLSv1.2", "TLSv1.1", "TLSv1", "TLSv1.0"}:
+        upper = cipher_name.upper()
+        if "GCM" in upper or "CHACHA20" in upper or "CCM" in upper:
+            return True
+        if "CBC" in upper:
+            return False
+        # Stream ciphers (RC4 etc.) and unrecognised: leave unknown.
+        return None
+    return None
 
 
 class NativeTlsProbe(Probe):
@@ -503,6 +524,14 @@ class NativeTlsProbe(Probe):
                         cipher_suite=cipher_name,
                         key_exchange_group=kex_group_name,
                         signature_algorithm=sig_algo_name,
+                        public_key_bits=cert_info.public_key_bits,
+                        public_key_algorithm_family=(
+                            cert_info.public_key_algorithm_family
+                        ),
+                        cert_not_after=cert_info.not_after,
+                        aead=_classify_tls_aead(
+                            version_str=version_str, cipher_name=cipher_name
+                        ),
                         elapsed_seconds=time.monotonic() - start,
                     )
             # else: keep reading more records to find Certificate
@@ -531,6 +560,9 @@ class NativeTlsProbe(Probe):
     ) -> ProbeResult:
         sig_algo_name = ""
         kex_group_name = ""
+        leaf_pk_bits: int | None = None
+        leaf_pk_family: str | None = None
+        leaf_not_after: str | None = None
 
         # Process any handshake messages that came in the same record as
         # SH (rare for real servers, but legal), then keep reading records
@@ -543,6 +575,9 @@ class NativeTlsProbe(Probe):
                     sig_algo_name = _w.cert_sig_algo_friendly_name(
                         cert_info.leaf_signature_algorithm_oid
                     )
+                    leaf_pk_bits = cert_info.public_key_bits
+                    leaf_pk_family = cert_info.public_key_algorithm_family
+                    leaf_not_after = cert_info.not_after
                     seen_cert = True
                 elif msg_type == _w.HS_SERVER_KEY_EXCHANGE:
                     curve_id = _w.parse_server_key_exchange_named_curve(msg_body)
@@ -556,6 +591,12 @@ class NativeTlsProbe(Probe):
                         cipher_suite=cipher_name,
                         key_exchange_group=kex_group_name,
                         signature_algorithm=sig_algo_name,
+                        public_key_bits=leaf_pk_bits,
+                        public_key_algorithm_family=leaf_pk_family,
+                        cert_not_after=leaf_not_after,
+                        aead=_classify_tls_aead(
+                            version_str=version_str, cipher_name=cipher_name
+                        ),
                         elapsed_seconds=time.monotonic() - start,
                     )
             content_type, _ver, payload = _w.read_record(sock, budget, max_total=MAX_RESPONSE_BYTES)
@@ -767,6 +808,61 @@ class StaticProbe(Probe):
         return result.model_copy(update={"target": target})
 
 
+class MultiplexProbe(Probe):
+    """Dispatch a probe call to the right per-protocol implementation.
+
+    The audit configuration may mix TLS endpoints, SSH endpoints, PGP
+    keys on disk, and S/MIME certificates on disk in a single run.
+    Rather than make every caller branch on protocol, the multiplex
+    probe holds a ``protocol -> Probe`` mapping and routes
+    :meth:`probe` calls accordingly.
+
+    Unmapped protocols return ``ProbeStatus.malformed`` with a clear
+    error_detail explaining which extras (if any) would enable that
+    protocol. This preserves the "no probe ever raises" contract.
+    """
+
+    def __init__(self, probes: dict[str, Probe]) -> None:
+        self._probes: dict[str, Probe] = dict(probes)
+
+    def register(self, protocol: str, probe: Probe) -> None:
+        """Add or replace a per-protocol probe."""
+        self._probes[protocol] = probe
+
+    def probe(self, target: AuditTarget) -> ProbeResult:
+        impl = self._probes.get(target.protocol)
+        if impl is None:
+            hint = ""
+            if target.protocol == "ssh":
+                hint = " (install qwashed[audit-ssh] for SSH support)"
+            return ProbeResult(
+                target=target,
+                status="malformed",
+                error_detail=(
+                    f"protocol={target.protocol!r} has no registered probe"
+                    f"{hint}"
+                ),
+            )
+        return impl.probe(target)
+
+
+def build_default_probe(*, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> MultiplexProbe:
+    """Build the Qwashed v0.2 default :class:`MultiplexProbe`.
+
+    Wires :class:`NativeTlsProbe` for ``tls``, :class:`PgpProbe` for
+    ``pgp``, and :class:`SmimeProbe` for ``smime``. SSH is omitted and
+    falls through to the multiplex's "no probe registered" branch
+    (yields ``malformed`` with an install hint).
+    """
+    return MultiplexProbe(
+        {
+            "tls": NativeTlsProbe(timeout_seconds=timeout_seconds),
+            "pgp": PgpProbe(),
+            "smime": SmimeProbe(),
+        }
+    )
+
+
 def probe_target(
     target: AuditTarget,
     *,
@@ -774,12 +870,19 @@ def probe_target(
 ) -> ProbeResult:
     """Probe a single target with the given probe implementation.
 
-    If ``probe_impl`` is omitted, defaults to :class:`NativeTlsProbe` (the
-    Qwashed v0.2 default). NativeTlsProbe captures full PQ posture
-    (version + cipher + KEX group + signature algorithm) using only stdlib
-    + ``cryptography``. SSH targets fail immediately with
-    ``ProbeStatus.malformed`` (SSH support is deferred to v0.1.1).
+    If ``probe_impl`` is omitted, defaults to :func:`build_default_probe`
+    which routes TLS targets through :class:`NativeTlsProbe`, PGP
+    targets through :class:`PgpProbe`, and S/MIME targets through
+    :class:`SmimeProbe`. SSH targets surface a "no probe registered"
+    diagnostic (SSH support is deferred to the ``[audit-ssh]`` extra).
     """
     if probe_impl is None:
-        probe_impl = NativeTlsProbe()
+        probe_impl = build_default_probe()
     return probe_impl.probe(target)
+
+
+# Re-exported here so module-level callers see the same API even though
+# the FILE_ONLY_PROTOCOLS constant is sourced from schemas. Used by the
+# CLI to know whether to resolve a target's key_path.
+__all__.append("FILE_ONLY_PROTOCOLS")
+__all__.append("build_default_probe")

@@ -18,6 +18,17 @@ The audit configuration file is YAML with the following shape::
       - host: 10.0.0.5
         port: 22
         protocol: ssh
+      # File-only targets (v0.2 §3.2). 'host' is repurposed as a stable
+      # human-readable identifier (e.g. the key owner's email). The path
+      # at 'key_path' is resolved relative to the config file's parent
+      # directory, so audit bundles can ship keys alongside the config.
+      - host: alice@example.org
+        protocol: pgp
+        key_path: keys/alice.asc
+        label: alice-primary
+      - host: bob@example.org
+        protocol: smime
+        key_path: keys/bob.crt
 
 The CLI is the single point that touches the filesystem and the network.
 Pure logic lives in :mod:`qwashed.audit.pipeline`, the probes, and the
@@ -46,8 +57,11 @@ from qwashed import __version__
 from qwashed.audit.pipeline import run_audit
 from qwashed.audit.probe import (
     DEFAULT_TIMEOUT_SECONDS,
+    MultiplexProbe,
     NativeTlsProbe,
+    PgpProbe,
     Probe,
+    SmimeProbe,
     SslyzeTlsProbe,
     StdlibTlsProbe,
 )
@@ -57,7 +71,8 @@ from qwashed.audit.profile_loader import (
     load_profile_from_path,
 )
 from qwashed.audit.report_html import render_audit_html
-from qwashed.audit.schemas import AuditTarget, ThreatProfile
+from qwashed.audit.schemas import FILE_ONLY_PROTOCOLS, AuditTarget, ThreatProfile
+from qwashed.audit.scoring import explain_finding
 from qwashed.core.canonical import canonicalize
 from qwashed.core.errors import ConfigurationError, QwashedError
 from qwashed.core.report import render_pdf
@@ -93,8 +108,32 @@ def _yaml_safe_load(text: str) -> Any:
         ) from exc
 
 
+def _resolve_key_path(raw_path: str, config_dir: Path) -> str:
+    """Resolve a YAML-supplied ``key_path`` against the config file's directory.
+
+    Absolute paths and ``~``-expanded paths are returned as-is (after
+    user expansion). Relative paths are resolved against ``config_dir``
+    so audit bundles can ship keys alongside the config without the
+    operator having to ``cd`` into the bundle directory before running
+    ``qwashed audit run``.
+
+    The path is *not* required to exist at config-load time; the
+    file-only probes report ``unreachable`` themselves on a missing
+    file, which keeps the "probe never raises" contract intact.
+    """
+    expanded = Path(raw_path).expanduser()
+    if expanded.is_absolute():
+        return str(expanded)
+    return str((config_dir / expanded).resolve(strict=False))
+
+
 def _load_targets(config_path: Path) -> list[AuditTarget]:
-    """Parse an audit config file and return the validated target list."""
+    """Parse an audit config file and return the validated target list.
+
+    Relative ``key_path`` values for file-only targets (PGP / S/MIME)
+    are resolved against ``config_path.parent`` so the config can ship
+    next to the keys it references.
+    """
     if not config_path.is_file():
         raise ConfigurationError(
             f"audit config not found: {config_path}",
@@ -113,6 +152,7 @@ def _load_targets(config_path: Path) -> list[AuditTarget]:
             f"audit config {config_path} must define a non-empty 'targets' list",
             error_code="audit.cli.no_targets",
         )
+    config_dir = config_path.parent.resolve()
     targets: list[AuditTarget] = []
     for entry in raw_targets:
         if not isinstance(entry, dict):
@@ -120,6 +160,15 @@ def _load_targets(config_path: Path) -> list[AuditTarget]:
                 f"each entry in 'targets' must be a mapping, got {type(entry).__name__}",
                 error_code="audit.cli.bad_target_entry",
             )
+        # Resolve any relative key_path before pydantic validation so
+        # the ProbeResult records the absolute path.
+        if (
+            entry.get("protocol") in FILE_ONLY_PROTOCOLS
+            and isinstance(entry.get("key_path"), str)
+            and entry["key_path"].strip()
+        ):
+            entry = dict(entry)
+            entry["key_path"] = _resolve_key_path(entry["key_path"], config_dir)
         target = parse_strict(AuditTarget, entry)
         assert isinstance(target, AuditTarget)
         targets.append(target)
@@ -206,23 +255,42 @@ def _profile_for_args(args: argparse.Namespace) -> ThreatProfile:
 def _probe_for_args(args: argparse.Namespace) -> Probe:
     """Construct the probe implementation requested by the CLI.
 
-    Default is ``NativeTlsProbe`` (Qwashed v0.2): full PQ posture with
-    only stdlib + ``cryptography``, no extras required. ``stdlib`` is the
-    legacy Python-``ssl`` probe (no KEX / no signature visibility) and
-    is kept for callers in air-gapped environments. ``sslyze`` requires
-    the ``[audit-deep]`` extra.
+    The returned object is always a :class:`MultiplexProbe`: the audit
+    config can mix TLS, PGP, and S/MIME targets in a single run, and
+    each protocol must dispatch to the right probe. The ``--probe``
+    flag selects the *TLS* probe slot inside the multiplex:
+
+    * ``native``  -- full-PQ posture via :class:`NativeTlsProbe`
+      (default; requires only stdlib + ``cryptography``).
+    * ``stdlib``  -- legacy :class:`StdlibTlsProbe` (no KEX / no
+      signature visibility), kept for air-gapped operators.
+    * ``sslyze``  -- :class:`SslyzeTlsProbe` (requires the
+      ``[audit-deep]`` extra).
+
+    PGP and S/MIME slots are always wired to the file-only
+    :class:`PgpProbe` and :class:`SmimeProbe` -- no flag overrides those
+    in v0.2.
     """
     timeout = float(getattr(args, "probe_timeout", DEFAULT_TIMEOUT_SECONDS))
     selected = getattr(args, "probe", "native")
+    tls_probe: Probe
     if selected == "native":
-        return NativeTlsProbe(timeout_seconds=timeout)
-    if selected == "stdlib":
-        return StdlibTlsProbe(timeout_seconds=timeout)
-    if selected == "sslyze":
-        return SslyzeTlsProbe(timeout_seconds=timeout)
-    raise ConfigurationError(
-        f"unknown probe implementation {selected!r}; expected one of native|stdlib|sslyze",
-        error_code="audit.cli.bad_probe",
+        tls_probe = NativeTlsProbe(timeout_seconds=timeout)
+    elif selected == "stdlib":
+        tls_probe = StdlibTlsProbe(timeout_seconds=timeout)
+    elif selected == "sslyze":
+        tls_probe = SslyzeTlsProbe(timeout_seconds=timeout)
+    else:
+        raise ConfigurationError(
+            f"unknown probe implementation {selected!r}; expected one of native|stdlib|sslyze",
+            error_code="audit.cli.bad_probe",
+        )
+    return MultiplexProbe(
+        {
+            "tls": tls_probe,
+            "pgp": PgpProbe(),
+            "smime": SmimeProbe(),
+        }
     )
 
 
@@ -323,6 +391,16 @@ def _audit_run(args: argparse.Namespace) -> int:
         except (QwashedError, OSError) as exc:
             sys.stderr.write(f"qwashed audit: PDF render failed: {exc}\n")
             return 2
+
+    # Optional --explain breakdown: one block per finding to stderr so
+    # it does not contaminate the JSON written to stdout when --output
+    # is omitted.
+    if getattr(args, "explain", False):
+        sys.stderr.write("\n# qwashed audit: per-finding boost breakdown (v0.2)\n")
+        for finding in report.findings:
+            sys.stderr.write("\n")
+            sys.stderr.write(explain_finding(finding, profile))
+            sys.stderr.write("\n")
 
     # Exit code 1 if any finding is critical (and 0 otherwise).
     if any(f.severity == "critical" for f in report.findings):
@@ -444,6 +522,15 @@ def build_audit_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
         help=(f"per-target probe timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS})"),
+    )
+    run_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help=(
+            "after writing the report, print a per-finding breakdown of "
+            "the v0.2 HNDL score (baseline + key-length / cert-lifetime / "
+            "AEAD boosts with rationale) to stderr"
+        ),
     )
     run_parser.set_defaults(func=_audit_run)
 

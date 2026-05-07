@@ -39,27 +39,40 @@ EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples" / "audit"
 # ---------------------------------------------------------------------------
 
 
-def _ok(host: str, port: int, **fields: str) -> ProbeResult:
+def _ok(host: str, port: int, **fields: Any) -> ProbeResult:
     return ProbeResult(
         target=AuditTarget(host=host, port=port),
         status="ok",
-        **fields,  # type: ignore[arg-type]
+        **fields,
     )
 
 
-_DEFAULT_TLS_FIELDS: dict[str, str] = {
+# v0.2 (§3.5) probe metadata: a 2048-bit RSA leaf cert with NotAfter
+# inside the horizon and an AEAD cipher. This represents a typical
+# "well-configured but classical" deployment — the v0.2 boosts should
+# all stay zero so the v0.1-vs-v0.2 wire diff for these targets only
+# adds the new fields with their default values.
+_DEFAULT_TLS_FIELDS: dict[str, Any] = {
     "negotiated_protocol_version": "TLSv1.3",
     "cipher_suite": "TLS_AES_128_GCM_SHA256",
     "key_exchange_group": "X25519",
     "signature_algorithm": "rsa_pss_rsae_sha256",
+    "public_key_bits": 2048,
+    "public_key_algorithm_family": "rsa",
+    "cert_not_after": "2027-03-15",
+    "aead": True,
 }
 
 
-_HYBRID_TLS_FIELDS: dict[str, str] = {
+_HYBRID_TLS_FIELDS: dict[str, Any] = {
     "negotiated_protocol_version": "TLSv1.3",
     "cipher_suite": "TLS_AES_128_GCM_SHA256",
     "key_exchange_group": "X25519MLKEM768",
     "signature_algorithm": "ed25519",
+    "public_key_bits": 256,
+    "public_key_algorithm_family": "ec",
+    "cert_not_after": "2027-09-01",
+    "aead": True,
 }
 
 

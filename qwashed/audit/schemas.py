@@ -43,6 +43,7 @@ from pydantic import AfterValidator, Field, field_validator, model_validator
 from qwashed.core.schemas import StrictBaseModel, nonempty_str
 
 __all__ = [
+    "FILE_ONLY_PROTOCOLS",
     "WEIGHT_SUM_TOLERANCE",
     "AuditFinding",
     "AuditReport",
@@ -75,9 +76,24 @@ Category = Literal["classical", "hybrid_pq", "pq_only", "unknown"]
 #: * ``refused``    -- target actively refused (e.g. TLS alert, RST).
 ProbeStatus = Literal["ok", "unreachable", "malformed", "refused"]
 
-#: Protocols supported in v0.1; SSH is feature-flagged in :mod:`probe` but
-#: defined here so the schema is stable across the v0.1 minor series.
-ProtocolKind = Literal["tls", "ssh"]
+#: Protocols recognized by the auditor.
+#:
+#: * ``tls``   -- network probe of a TLS server (default)
+#: * ``ssh``   -- network probe of an SSH server (feature-flagged in
+#:   :mod:`probe`; v0.1.1+ via the ``[audit-ssh]`` extra)
+#: * ``pgp``   -- file-only probe of an OpenPGP public key (binary or
+#:   ASCII-armored). Added in v0.2 (§3.2).
+#: * ``smime`` -- file-only probe of an S/MIME X.509 certificate (PEM or
+#:   DER). Added in v0.2 (§3.2).
+#:
+#: ``pgp`` and ``smime`` targets are file-only: they read from
+#: :attr:`AuditTarget.key_path` and never touch the network.
+ProtocolKind = Literal["tls", "ssh", "pgp", "smime"]
+
+#: Protocols whose targets are file-only (no host:port). The schema and
+#: probe layers special-case these so a missing / zero port does not fail
+#: validation, and so the file-only probes can be wired in cleanly.
+FILE_ONLY_PROTOCOLS: frozenset[str] = frozenset({"pgp", "smime"})
 
 #: Severity bucket for a single finding. Maps onto the score tiers in
 #: :mod:`qwashed.audit.scoring`.
@@ -85,29 +101,68 @@ Severity = Literal["info", "low", "moderate", "high", "critical"]
 
 
 class AuditTarget(StrictBaseModel):
-    """A single host:port to audit.
+    """A single audit target.
+
+    Two shapes are supported:
+
+    * **Network targets** (``protocol`` is ``"tls"`` or ``"ssh"``): identified
+      by ``host`` + ``port``. ``key_path`` MUST be unset.
+    * **File targets** (``protocol`` is ``"pgp"`` or ``"smime"``): identified
+      by ``key_path``. ``host`` is still required (use the key owner's email
+      or another stable identifier so the report is human-readable). ``port``
+      defaults to 0 and is unused.
 
     Parameters
     ----------
     host:
-        Hostname or IPv4/IPv6 literal. Whitespace stripped; validated
-        non-empty. We do not resolve here; the probe layer handles
-        resolution and reports DNS failure as ``ProbeStatus.unreachable``.
+        Hostname / IPv4 / IPv6 literal for network targets, or a free-form
+        identifier (e.g. ``"alice@example.org"``) for file targets.
+        Whitespace stripped; validated non-empty.
     port:
-        TCP port (1-65535).
+        TCP port (1-65535) for network targets. For file targets, defaults
+        to 0 and is ignored.
     protocol:
-        ``"tls"`` or ``"ssh"``. SSH probing is gated behind the ``[audit-ssh]``
-        extra; CLI rejects ``"ssh"`` targets unless the extra is installed.
+        One of ``"tls"``, ``"ssh"``, ``"pgp"``, ``"smime"``. ``ssh`` probing
+        is gated behind the ``[audit-ssh]`` extra. ``pgp`` and ``smime``
+        are file-only and added in v0.2 (§3.2).
     label:
         Optional human-readable identifier carried through to the report
         (e.g. ``"intake-mailserver-prod"``). Useful when many hosts share
         a name template.
+    key_path:
+        Path to the file to probe for ``protocol in {"pgp", "smime"}``.
+        Required for file-only protocols; rejected for network protocols.
+        Whether the path is resolved relative to the audit config or
+        absolute is the CLI loader's concern; the schema only validates
+        non-emptiness when set.
     """
 
     host: Annotated[str, AfterValidator(nonempty_str)]
-    port: int = Field(ge=1, le=65535)
+    port: int = Field(ge=0, le=65535, default=0)
     protocol: ProtocolKind = "tls"
     label: str | None = None
+    key_path: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_protocol_fields(self) -> AuditTarget:
+        is_file = self.protocol in FILE_ONLY_PROTOCOLS
+        if is_file:
+            if not self.key_path or not self.key_path.strip():
+                raise ValueError(
+                    f"protocol={self.protocol!r} requires a non-empty 'key_path'",
+                )
+        else:
+            if self.port < 1:
+                raise ValueError(
+                    f"protocol={self.protocol!r} requires a 'port' in [1, 65535], "
+                    f"got {self.port}",
+                )
+            if self.key_path is not None:
+                raise ValueError(
+                    f"protocol={self.protocol!r} does not accept 'key_path' "
+                    "(file-only field reserved for pgp/smime targets)",
+                )
+        return self
 
 
 class ProbeResult(StrictBaseModel):
@@ -145,6 +200,28 @@ class ProbeResult(StrictBaseModel):
     #: Diagnostic detail when ``status != "ok"``. Should be safe to log;
     #: never includes raw bytes from the wire.
     error_detail: str = ""
+    #: Public-key bit length (RSA/DSA modulus bits, EC curve bits).
+    #: ``None`` for fixed-size algorithms (Ed25519, ML-DSA-65, ...) and
+    #: when the probe could not determine the size. Used by the v0.2
+    #: scoring layer (§3.5) to apply key-length penalties.
+    public_key_bits: int | None = Field(default=None, ge=0)
+    #: Public-key algorithm family used for key-length policy gating.
+    #: One of ``"rsa"``, ``"dsa"``, ``"ec"``, ``"ed25519"``, ``"ed448"``,
+    #: ``"x25519"``, ``"x448"``, ``"mldsa"``, ``"mlkem"``, or ``None`` if
+    #: the probe could not classify the family. Independent of the
+    #: per-protocol wire-name in :attr:`signature_algorithm`/
+    #: :attr:`key_exchange_group`.
+    public_key_algorithm_family: str | None = None
+    #: TLS leaf-cert / S/MIME cert NotAfter as ISO 8601 ``YYYY-MM-DD``.
+    #: ``None`` for protocols without an X.509 chain (PGP) or when the
+    #: probe could not parse the field. Used by the v0.2 cert-lifetime
+    #: boost.
+    cert_not_after: str | None = None
+    #: Whether the negotiated cipher provides AEAD. ``True`` for TLS 1.3
+    #: (always AEAD), TLS 1.2 GCM/CHACHA20/CCM. ``False`` for TLS 1.2
+    #: CBC suites. ``None`` for protocols where AEAD is not a concept
+    #: (SSH cipher framing, file probes).
+    aead: bool | None = None
 
 
 class AuditFinding(StrictBaseModel):
@@ -228,6 +305,24 @@ class ThreatProfile(StrictBaseModel):
     severity_thresholds: dict[str, float]
     #: ``"max"`` (worst target dominates) or ``"mean"`` (average).
     aggregation: Literal["max", "mean"] = "max"
+    #: Whether to apply v0.2 key-length / cert-lifetime / non-AEAD score
+    #: boosts on top of the v0.1 baseline. Defaults to ``True``; profiles
+    #: that want strict v0.1 parity can set this to ``False`` (e.g. for
+    #: regression tests or for running against historical baselines).
+    enable_v02_scoring: bool = True
+    #: Optional override of the built-in v0.2 key-length policy. Recognised
+    #: keys: ``"rsa_minimum"`` (RSA bits below this trigger the +0.10 boost,
+    #: default 2048), ``"rsa_strong"`` (RSA bits below this and ≥
+    #: ``rsa_minimum`` trigger +0.05, default 3072), ``"ecc_minimum"``
+    #: (EC bits below this trigger +0.05, default 224). Missing keys
+    #: fall back to the documented defaults.
+    key_length_thresholds: dict[str, int] | None = None
+    #: ISO 8601 ``YYYY-MM-DD`` cutoff for the cert-lifetime boost. A leaf
+    #: cert with NotAfter strictly greater than this date adds +0.05 to
+    #: the score. Defaults to ``"2030-01-01"`` when ``None``: a cert
+    #: outliving 2030 gives a state-level HNDL adversary plenty of
+    #: harvest window before quantum attacks become practical.
+    cert_lifetime_horizon: str | None = None
 
     @model_validator(mode="after")
     def _check_weights(self) -> ThreatProfile:

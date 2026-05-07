@@ -17,8 +17,10 @@ Free post-quantum hygiene for civil society:
 > HNDL auditor, and hybrid PQ vault are all functional and tested. Treat
 > v0.1.x as evaluation-grade software: suitable for pilot deployments by
 > civil-society IT teams, not yet a substitute for an audited mature
-> system. See [`THREAT_MODEL.md`](./THREAT_MODEL.md) for in-scope /
-> out-of-scope adversaries.
+> system. See [QWASHED_BUILD_PLAN.txt](./QWASHED_BUILD_PLAN.txt) for the
+> full build plan and acceptance criteria, and
+> [`THREAT_MODEL.md`](./THREAT_MODEL.md) for in-scope / out-of-scope
+> adversaries.
 
 ---
 
@@ -220,7 +222,9 @@ For developers and security engineers evaluating Qwashed against alternatives:
   cryptographic review of the integration code (the underlying primitives —
   ML-KEM-768 and ML-DSA-65 — are NIST-standardized in FIPS 203 / FIPS 204).
 - **Auditing keys held in HSMs, mobile keychains, or RSA/ECC usage embedded in
-  your own codebase.** v0.1 covers TLS and SSH endpoints only.
+  your own codebase.** v0.1 covers TLS and SSH endpoints; v0.2 (in development)
+  adds offline PGP and S/MIME key/cert audit but still does not reach into HSMs
+  or mobile keychains.
 - **Threshold or M-of-N decryption.** Many real journalist-source workflows
   want this. v0.1 does not have it; age plugins do.
 

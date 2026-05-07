@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Example audit config for S/MIME (X.509) leaf certificates (Qwashed
+# v0.2 §3.2).
+#
+# File-only protocol: ``host`` is the certificate subject email or a
+# friendly label, ``port`` is set to 0 (ignored), and ``key_path``
+# points at a PEM- or DER-encoded leaf certificate. Relative paths are
+# resolved against this YAML's directory.
+#
+# The probe reads only the leaf certificate; chain validity, expiry,
+# and revocation are explicitly out of scope for v0.1 (see
+# probe_smime.py for the rationale).
+targets:
+  - host: alice@example.org
+    port: 0
+    protocol: smime
+    label: alice-leaf
+    key_path: certs/alice.pem
+  - host: legal@example.org
+    port: 0
+    protocol: smime
+    label: legal-team-leaf
+    key_path: certs/legal_team.der

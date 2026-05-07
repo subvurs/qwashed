@@ -16,8 +16,16 @@ from qwashed.audit.schemas import (
     ThreatProfile,
 )
 from qwashed.audit.scoring import (
+    V02_BOOST_CERT_LIFETIME,
+    V02_BOOST_ECC_LT_MIN,
+    V02_BOOST_NON_AEAD,
+    V02_BOOST_RSA_LT_MIN,
+    V02_BOOST_RSA_LT_STRONG,
+    V02_MAX_PER_CONTRIBUTION,
+    V02_MAX_TOTAL_BOOST,
     aggregate_score,
     aggregate_severity,
+    explain_finding,
     score_finding,
     severity_for,
 )
@@ -191,3 +199,379 @@ class TestPropertyMonotonic:
         prof = _profile()
         result = severity_for(score, prof)
         assert result in {"info", "low", "moderate", "high", "critical"}
+
+
+# ---------------------------------------------------------------------------
+# §3.5 Richer HNDL scoring (v0.2)
+# ---------------------------------------------------------------------------
+
+
+def _finding_with_probe(
+    *,
+    category: str = "classical",
+    public_key_bits: int | None = None,
+    public_key_algorithm_family: str | None = None,
+    cert_not_after: str | None = None,
+    aead: bool | None = None,
+) -> AuditFinding:
+    """Build a finding whose probe carries v0.2 fields exercised by the boosts."""
+    target = AuditTarget(host="x.example", port=443, protocol="tls")
+    probe = ProbeResult(
+        target=target,
+        status="ok",
+        public_key_bits=public_key_bits,
+        public_key_algorithm_family=public_key_algorithm_family,
+        cert_not_after=cert_not_after,
+        aead=aead,
+    )
+    return AuditFinding(
+        target=target,
+        probe=probe,
+        category=category,  # type: ignore[arg-type]
+        severity="info",
+        score=0.0,
+        rationale="placeholder",
+    )
+
+
+class TestV02Scoring:
+    """Per-contribution boosts and the ±0.20 envelope (§3.5)."""
+
+    def test_no_v02_data_no_boost(self) -> None:
+        # If the probe carries no v0.2 fields, the v0.2 boosts must be
+        # zero; baseline must equal the v0.1 closed-form.
+        prof = _profile()
+        finding = score_finding(_placeholder_finding("classical"), prof)
+        baseline = prof.category_weights["classical"] * prof.archival_likelihood
+        assert finding.score == pytest.approx(baseline, abs=1e-9)
+
+    def test_rsa_below_min_boost(self) -> None:
+        # RSA-1024 < 2048 -> +V02_BOOST_RSA_LT_MIN (clamped at +0.10).
+        prof = _profile()
+        baseline = prof.category_weights["classical"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="classical",
+                public_key_bits=1024,
+                public_key_algorithm_family="rsa",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            min(1.0, baseline + V02_BOOST_RSA_LT_MIN), abs=1e-9
+        )
+
+    def test_rsa_below_strong_boost(self) -> None:
+        # RSA-2048: weak (>=2048 but <3072) -> +V02_BOOST_RSA_LT_STRONG.
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                public_key_bits=2048,
+                public_key_algorithm_family="rsa",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            baseline + V02_BOOST_RSA_LT_STRONG, abs=1e-9
+        )
+
+    def test_rsa_at_strong_no_boost(self) -> None:
+        # RSA-3072 >= strong threshold -> no key-length boost.
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                public_key_bits=3072,
+                public_key_algorithm_family="rsa",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(baseline, abs=1e-9)
+
+    def test_dsa_treated_as_rsa_family(self) -> None:
+        # DSA shares the integer-factorization-class threshold ladder.
+        prof = _profile()
+        baseline = prof.category_weights["classical"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="classical",
+                public_key_bits=1024,
+                public_key_algorithm_family="dsa",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            min(1.0, baseline + V02_BOOST_RSA_LT_MIN), abs=1e-9
+        )
+
+    def test_ecc_below_min_boost(self) -> None:
+        # ECC-160 < 224 -> +V02_BOOST_ECC_LT_MIN.
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                public_key_bits=160,
+                public_key_algorithm_family="ec",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            baseline + V02_BOOST_ECC_LT_MIN, abs=1e-9
+        )
+
+    def test_ecc_at_min_no_boost(self) -> None:
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                public_key_bits=256,
+                public_key_algorithm_family="ec",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(baseline, abs=1e-9)
+
+    def test_cert_lifetime_past_horizon_boost(self) -> None:
+        # NotAfter past 2030-01-01 horizon -> +V02_BOOST_CERT_LIFETIME.
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                cert_not_after="2031-06-15",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            baseline + V02_BOOST_CERT_LIFETIME, abs=1e-9
+        )
+
+    def test_cert_lifetime_inside_horizon_no_boost(self) -> None:
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                cert_not_after="2027-01-01",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(baseline, abs=1e-9)
+
+    def test_non_aead_boost(self) -> None:
+        # aead=False -> +V02_BOOST_NON_AEAD; aead=True or None -> no boost.
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(category="hybrid_pq", aead=False),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            baseline + V02_BOOST_NON_AEAD, abs=1e-9
+        )
+
+    def test_aead_true_no_boost(self) -> None:
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(category="hybrid_pq", aead=True),
+            prof,
+        )
+        assert finding.score == pytest.approx(baseline, abs=1e-9)
+
+    def test_total_boost_clamped_at_v02_max(self) -> None:
+        # All four contributions stack: RSA<2048 (+0.10) + cert lifetime
+        # (+0.05) + non-AEAD (+0.05) = +0.20 exactly; total clamp leaves
+        # them as-is. Add ECC family arm separately so we can probe the
+        # >0.20 case via the threshold-override test.
+        prof = _profile()
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                public_key_bits=1024,
+                public_key_algorithm_family="rsa",
+                cert_not_after="2031-06-15",
+                aead=False,
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            baseline + V02_MAX_TOTAL_BOOST, abs=1e-9
+        )
+
+    def test_per_contribution_clamp_documented(self) -> None:
+        # Sanity: V02_BOOST_RSA_LT_MIN equals V02_MAX_PER_CONTRIBUTION
+        # so a single weak-RSA finding cannot exceed the per-arm cap.
+        assert V02_BOOST_RSA_LT_MIN <= V02_MAX_PER_CONTRIBUTION
+
+    def test_score_capped_at_one(self) -> None:
+        # Even with maximum boost the final score is in [0, 1].
+        prof = load_profile("journalism")
+        # journalism: classical=1.0 * archival=0.95 = 0.95; +0.20 -> 1.15
+        # which must clamp to 1.0.
+        finding = score_finding(
+            _finding_with_probe(
+                category="classical",
+                public_key_bits=1024,
+                public_key_algorithm_family="rsa",
+                cert_not_after="2031-06-15",
+                aead=False,
+            ),
+            prof,
+        )
+        assert finding.score <= 1.0
+        assert finding.score == pytest.approx(1.0, abs=1e-9)
+
+    def test_threshold_override_min_bits(self) -> None:
+        # Custom RSA min bumped to 4096 -> a 3072-bit key now triggers
+        # the "below strong" boost on a profile with a 3072-strong limit.
+        prof_data = load_profile("default").model_dump()
+        prof_data["key_length_thresholds"] = {
+            "rsa_minimum": 4096,
+            "rsa_strong": 8192,
+            "ecc_minimum": 224,
+        }
+        prof = parse_strict(ThreatProfile, prof_data)
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                public_key_bits=3072,
+                public_key_algorithm_family="rsa",
+            ),
+            prof,
+        )
+        # 3072 < 4096 -> below_min boost.
+        assert finding.score == pytest.approx(
+            min(1.0, baseline + V02_BOOST_RSA_LT_MIN), abs=1e-9
+        )
+
+    def test_horizon_override(self) -> None:
+        # Custom horizon: pull it back to 2026-01-01 so a 2027 NotAfter
+        # is now past horizon.
+        prof_data = load_profile("default").model_dump()
+        prof_data["cert_lifetime_horizon"] = "2026-01-01"
+        prof = parse_strict(ThreatProfile, prof_data)
+        baseline = prof.category_weights["hybrid_pq"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                cert_not_after="2027-01-01",
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(
+            baseline + V02_BOOST_CERT_LIFETIME, abs=1e-9
+        )
+
+    def test_v02_disabled_yields_v01_score(self) -> None:
+        # enable_v02_scoring=False -> baseline-only path.
+        prof_data = load_profile("default").model_dump()
+        prof_data["enable_v02_scoring"] = False
+        prof = parse_strict(ThreatProfile, prof_data)
+        baseline = prof.category_weights["classical"] * prof.archival_likelihood
+        finding = score_finding(
+            _finding_with_probe(
+                category="classical",
+                public_key_bits=1024,
+                public_key_algorithm_family="rsa",
+                cert_not_after="2031-06-15",
+                aead=False,
+            ),
+            prof,
+        )
+        assert finding.score == pytest.approx(baseline, abs=1e-9)
+
+
+class TestV02PropertyEnvelope:
+    """Total v0.2 boost is in [0, V02_MAX_TOTAL_BOOST] for any input combination."""
+
+    @given(
+        category=st.sampled_from(["classical", "hybrid_pq", "pq_only", "unknown"]),
+        rsa_bits=st.one_of(st.none(), st.integers(min_value=512, max_value=8192)),
+        ecc_bits=st.one_of(st.none(), st.integers(min_value=128, max_value=521)),
+        not_after=st.sampled_from(
+            [None, "2024-01-01", "2027-01-01", "2031-06-15", "2099-12-31"]
+        ),
+        aead=st.one_of(st.none(), st.booleans()),
+        family=st.sampled_from(["rsa", "dsa", "ec", "", None]),
+    )
+    def test_envelope(
+        self,
+        category: str,
+        rsa_bits: int | None,
+        ecc_bits: int | None,
+        not_after: str | None,
+        aead: bool | None,
+        family: str | None,
+    ) -> None:
+        prof = _profile()
+        # Pick the bits field according to the family so the test
+        # exercises both arms; if family is None we still allow an
+        # arbitrary bits value (it must not produce a boost).
+        if family in ("rsa", "dsa"):
+            bits = rsa_bits
+        elif family == "ec":
+            bits = ecc_bits
+        else:
+            bits = rsa_bits
+        finding = score_finding(
+            _finding_with_probe(
+                category=category,
+                public_key_bits=bits,
+                public_key_algorithm_family=family,
+                cert_not_after=not_after,
+                aead=aead,
+            ),
+            prof,
+        )
+        baseline = (
+            prof.category_weights[category]  # type: ignore[index]
+            * prof.archival_likelihood
+        )
+        # Final score = clamp_unit(baseline + boost). Recover boost from
+        # the difference and assert it's in the envelope.
+        observed_boost = finding.score - baseline
+        # Envelope: post-clamp boost is in [-baseline, +V02_MAX_TOTAL_BOOST].
+        # The lower edge can dip negative only if baseline+boost > 1 was
+        # clamped down to 1 (then observed_boost = 1 - baseline).
+        assert observed_boost >= -1e-9 - max(baseline + V02_MAX_TOTAL_BOOST - 1.0, 0.0)
+        assert observed_boost <= V02_MAX_TOTAL_BOOST + 1e-9
+
+
+class TestExplainFinding:
+    """`explain_finding` produces a human-readable, deterministic breakdown."""
+
+    def test_baseline_only(self) -> None:
+        prof = _profile()
+        finding = score_finding(_placeholder_finding("classical"), prof)
+        text = explain_finding(finding, prof)
+        assert "target=" in text
+        assert "category=" in text
+        assert "score=" in text
+        assert "severity=" in text
+
+    def test_with_boosts_lists_each(self) -> None:
+        prof = _profile()
+        finding = score_finding(
+            _finding_with_probe(
+                category="hybrid_pq",
+                public_key_bits=1024,
+                public_key_algorithm_family="rsa",
+                cert_not_after="2031-06-15",
+                aead=False,
+            ),
+            prof,
+        )
+        text = explain_finding(finding, prof)
+        # Each boost arm must be named in the breakdown.
+        assert "boost" in text
+        assert "rsa" in text.lower() or "key" in text.lower()
+        assert "cert" in text.lower() or "lifetime" in text.lower()
+        assert "aead" in text.lower()

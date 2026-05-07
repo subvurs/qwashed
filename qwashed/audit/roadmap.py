@@ -99,21 +99,99 @@ _ROADMAP_BASELINE: Final[dict[tuple[str, Category], list[str]]] = {
         "tables.",
         "Treat as classical-equivalent until the algorithm is recognized.",
     ],
+    ("pgp", "classical"): [
+        "Generate a hybrid Ed25519+ML-DSA-65 OpenPGP key (algorithm 30 "
+        "or the equivalent multi-key bundle) once your OpenPGP "
+        "implementation supports RFC 9580 hybrid algorithms.",
+        "Until hybrid PQ OpenPGP keys are available in your toolchain, "
+        "rotate to a fresh Ed25519 primary key with an X25519 encryption "
+        "subkey; this is not PQ-safe but is the strongest classical "
+        "OpenPGP posture in 2026.",
+        "Republish updated keys to your key directory (WKD, Hagrid, or "
+        "internal keyring) and notify correspondents of the fingerprint "
+        "change so they can re-verify.",
+        "Retain the old classical key only for decrypting historical "
+        "ciphertext; do not use it for new encryption or signing.",
+    ],
+    ("pgp", "hybrid_pq"): [
+        "Hybrid PQ OpenPGP key in place. Verify the hybrid pairing "
+        "matches the RFC 9580 / draft-ietf-openpgp-pqc choice your "
+        "correspondents support.",
+        "Continue distributing the public key via your key directory "
+        "and update key servers when fingerprints rotate.",
+    ],
+    ("pgp", "pq_only"): [
+        "Pure-PQ OpenPGP keys are uncommon and may not interoperate with "
+        "all correspondents. Verify this is intentional; for most users "
+        "hybrid PQ is the safer default.",
+        "Track NIST and IETF guidance for any PQ primitive deprecation; "
+        "pure-PQ keys must rotate quickly if a flaw is announced.",
+    ],
+    ("pgp", "unknown"): [
+        "Probe could not classify the PGP key algorithm. Confirm the "
+        "file is a PGP public-key block (not a private key, not a "
+        "keyring export) and re-run.",
+        "If the algorithm wire-name is genuinely missing from the "
+        "Qwashed tables, capture it and submit it via the Qwashed "
+        "issue tracker.",
+        "Treat the key as classical-equivalent until the algorithm is "
+        "recognized.",
+    ],
+    ("smime", "classical"): [
+        "Once your CA supports it, request a hybrid Ed25519+ML-DSA-65 "
+        "S/MIME certificate; in the interim, an Ed25519 leaf chained "
+        "to an Ed25519 issuer is the strongest classical posture.",
+        "Disable RSA-PKCS#1-v1.5 signature algorithms (sha256_with_rsa "
+        "etc.) where possible; prefer RSASSA-PSS or EdDSA leaves.",
+        "If signing under PKCS#7 / CMS, ensure the digest algorithm is "
+        "SHA-256 or stronger; reject SHA-1-signed certificates.",
+        "Plan for a chain-wide migration: a hybrid leaf under a "
+        "classical issuer is still classical-protected at the trust "
+        "anchor.",
+    ],
+    ("smime", "hybrid_pq"): [
+        "Hybrid PQ S/MIME certificate in place. Verify the chain (root + "
+        "issuer + leaf) is hybrid-PQ end-to-end; a hybrid leaf under a "
+        "classical issuer is still classical-bound at the trust anchor.",
+        "Track CA roadmap announcements; some hybrid PQ profiles in "
+        "current drafts may be reissued under the final RFC.",
+    ],
+    ("smime", "pq_only"): [
+        "Pure-PQ S/MIME certificates are rare and may break "
+        "interoperation with older clients (e.g., legacy email "
+        "gateways). Verify this is intentional.",
+        "Continue tracking NIST / IETF PQ-cert profile guidance; pure-PQ "
+        "certificates must be rotated promptly if a primitive is "
+        "deprecated.",
+    ],
+    ("smime", "unknown"): [
+        "Probe could not classify the certificate's algorithms. Confirm "
+        "the file is a leaf X.509 certificate (PEM or DER), not a "
+        "PKCS#12 bundle or a private key.",
+        "If the algorithm OIDs or curve names are genuinely missing "
+        "from the Qwashed tables, capture them and submit via the "
+        "Qwashed issue tracker.",
+        "Treat as classical-equivalent until the algorithm is recognized.",
+    ],
 }
 
 
 #: Per-status notes for non-OK probes.
 _ROADMAP_NON_OK: Final[dict[str, list[str]]] = {
     "unreachable": [
-        "Probe could not reach the target. Check DNS, firewall rules, "
-        "and that the service is listening on the expected port.",
+        "Probe could not reach the target. For network targets check "
+        "DNS, firewall rules, and that the service is listening on the "
+        "expected port. For file targets (PGP / S/MIME) check that "
+        "key_path exists and is readable by the audit process.",
         "If the target is intentionally not exposed to the audit host, "
         "remove it from the audit list.",
     ],
     "malformed": [
-        "Target responded but the response was not a valid TLS or SSH "
-        "handshake. Possible causes: wrong port, plaintext service "
-        "behind a TLS terminator, captive-portal interference.",
+        "Target responded but the data was not a valid TLS / SSH "
+        "handshake or PGP / S/MIME key file. Possible causes: wrong "
+        "port, plaintext service behind a TLS terminator, captive-"
+        "portal interference, truncated or non-key file at key_path, "
+        "or ASCII-armored data with corrupted base64 body.",
     ],
     "refused": [
         "Target actively refused the connection. Verify the service is "

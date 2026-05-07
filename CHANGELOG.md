@@ -9,12 +9,364 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 v0.2 development is underway. ROADMAP §3.6 (vault format v0.2 migration
 path) landed 2026-05-05; ROADMAP §3.4 (hand-rolled `NativeTlsProbe`,
-sslyze becomes opt-in via `[audit-deep]`) landed 2026-05-06; remaining
-v0.2 work items (§3.1–3.3, §3.5, §3.7–3.9) are pending. v0.2 readers
-continue to read v0.1 entries through the v0.4 deprecation window per
-`THREAT_MODEL.md` §"Versioning and forward compatibility".
+sslyze becomes opt-in via `[audit-deep]`) landed 2026-05-06; ROADMAP
+§3.2 (Email PGP / S/MIME audit probe) landed 2026-05-06; ROADMAP §3.5
+(richer HNDL scoring) landed 2026-05-06; remaining v0.2 work items
+(§3.1, §3.3, §3.7–3.9) are pending. v0.2 readers continue to read v0.1
+entries through the v0.4 deprecation window per `THREAT_MODEL.md`
+§"Versioning and forward compatibility".
 
 ### Added
+
+#### Richer HNDL scoring (ROADMAP §3.5) — 2026-05-06
+
+- `qwashed/audit/schemas.py`:
+  - `ProbeResult` gains four optional v0.2 fields, all defaulting to
+    `None` so v0.1 fixtures and probes that do not yet populate them
+    serialize identically:
+    `public_key_bits: int | None` (RSA / DSA modulus bit length, or
+    EC curve key size in bits); `public_key_algorithm_family: str | None`
+    (coarse `"rsa" | "dsa" | "ec" | "elgamal" | ""` family used by the
+    boost router); `cert_not_after: str | None` (ISO 8601 `YYYY-MM-DD`
+    leaf-cert NotAfter); `aead: bool | None` (TLS 1.3 ⇒ `True`; TLS
+    1.2 ⇒ True for GCM / CHACHA20 / CCM, False for CBC; `None` if not
+    determined).
+  - `ThreatProfile` gains three optional v0.2 fields:
+    `enable_v02_scoring: bool = True` (master switch — set False to
+    pin a profile to v0.1-equivalent scoring during the deprecation
+    window); `key_length_thresholds: dict[str, int] | None` (override
+    the `rsa_minimum` / `rsa_strong` / `ecc_minimum` cutoffs);
+    `cert_lifetime_horizon: str | None` (override the
+    `2030-01-01` default horizon).
+- `qwashed/audit/scoring.py`:
+  - New v0.2 boost catalog with per-arm and total caps as `Final`
+    constants: `V02_MAX_PER_CONTRIBUTION = 0.10`,
+    `V02_MAX_TOTAL_BOOST = 0.20`, `V02_BOOST_RSA_LT_MIN = 0.10`
+    (RSA / DSA below `rsa_minimum`, default 2048),
+    `V02_BOOST_RSA_LT_STRONG = 0.05` (RSA / DSA in
+    `[rsa_minimum, rsa_strong)`, default `[2048, 3072)`),
+    `V02_BOOST_ECC_LT_MIN = 0.05` (EC below `ecc_minimum`, default
+    224 bits), `V02_BOOST_CERT_LIFETIME = 0.05` (NotAfter past
+    horizon), `V02_BOOST_NON_AEAD = 0.05` (`aead is False`).
+  - New `_resolve_key_length_thresholds(profile)` and
+    `_resolve_cert_horizon(profile)` helpers consult the profile's
+    optional override fields and fall back to the
+    `DEFAULT_RSA_MIN_BITS` / `DEFAULT_RSA_STRONG_BITS` /
+    `DEFAULT_ECC_MIN_BITS` / `DEFAULT_CERT_LIFETIME_HORIZON` constants.
+    `ConfigurationError` on negative or non-monotonic values.
+  - New `_compute_v02_boosts(probe, profile) -> list[(name, value, why)]`
+    encapsulates the four arms (key-length, ECC-minimum, cert-lifetime,
+    non-AEAD) and emits a per-arm rationale string.
+  - New `_clamp_total_boost(boosts) -> (total, boosts_with_clamp_marker)`:
+    proportionally scales each arm down when `sum > V02_MAX_TOTAL_BOOST`
+    and appends `[clamped]` to the rationale of every clamped arm so
+    the operator can see the cap fired.
+  - `score_finding(...)` refactored: baseline (= v0.1 closed form)
+    plus `total_boost`, clamped to `[0, 1]`. Rationale is extended
+    with `v0.2 boosts: <name>+0.xx (why), …` when boosts apply.
+    `enable_v02_scoring=False` short-circuits to baseline-only.
+  - New `explain_finding(finding, profile) -> str`: multi-line
+    breakdown — `target=…`, `category=… (baseline=W*A=…)`,
+    `boost <name>=… (why)` per arm, `total_boost=… (clamped|raw)`,
+    `score=…`, `severity=…`. Pure function (no I/O); used by
+    `qwashed audit run --explain` for operator visibility.
+- `qwashed/audit/_tls_wire.py`:
+  - `CertificateInfo` extended with `public_key_algorithm_family`
+    (`"rsa" | "dsa" | "ec" | "ed25519" | "ed448" | "x25519" | "x448"
+    | None`), `public_key_bits` (RSA / DSA modulus, EC curve key size,
+    or `None` for the Edwards / X-curve fixed-size keys), and
+    `not_after` (ISO `YYYY-MM-DD`).
+  - New `_classify_x509_public_key(cert)` helper isinstance-dispatches
+    over `cryptography`'s `RSAPublicKey` / `DSAPublicKey` /
+    `EllipticCurvePublicKey` / `Ed25519PublicKey` / `Ed448PublicKey`
+    / `X25519PublicKey` / `X448PublicKey`.
+  - New `_cert_not_after_iso(cert)` helper reads
+    `not_valid_after_utc` (`cryptography>=42`) with a documented
+    legacy-`not_valid_after` fallback, formats as `"%Y-%m-%d"`.
+  - `parse_certificate_message(...)` populates the three new fields on
+    the leaf cert.
+- `qwashed/audit/probe.py`:
+  - New `_classify_tls_aead(*, version_str, cipher_name) -> bool | None`:
+    TLS 1.3 always `True` (every TLS 1.3 cipher suite is AEAD by spec);
+    TLS 1.2 → `True` when the suite name carries `GCM`, `CHACHA20`, or
+    `CCM`, `False` for `CBC`, otherwise `None`.
+  - `StdlibTlsProbe` success path threads `aead=_classify_tls_aead(...)`
+    into the `ProbeResult` (cert metadata fields remain `None` because
+    `ssl.SSLSocket.getpeercert(binary_form=True)` is not parsed by this
+    probe — the deeper extraction lives in `NativeTlsProbe`).
+  - `NativeTlsProbe` (TLS 1.3 success path): threads
+    `public_key_bits`, `public_key_algorithm_family`, `cert_not_after`
+    (from the leaf `CertificateInfo`) and `aead` into the success
+    `ProbeResult`.
+  - `NativeTlsProbe` (TLS 1.2 path): captures `leaf_pk_bits`,
+    `leaf_pk_family`, `leaf_not_after` locals during the
+    `HS_CERTIFICATE` parse and threads them into the
+    `SERVER_HELLO_DONE` success `ProbeResult` alongside `aead`.
+- `qwashed/audit/probe_smime.py`:
+  - `SmimeCertInfo` gains `public_key_family: str = ""` and
+    `not_after: str | None = None`.
+  - `_classify_public_key(...)` now returns
+    `(wire_name, bit_length, family)`; EC keys report `curve.key_size`
+    as the bit length so the v0.2 ECC threshold arm can fire.
+  - New `_smime_not_after_iso(cert)` helper (parallel to the
+    `_tls_wire` version).
+  - `parse_smime_certificate(...)` populates the new fields.
+  - `SmimeProbe.probe(...)` threads `public_key_bits` (`None` if
+    zero), `public_key_algorithm_family` (`None` if empty), and
+    `cert_not_after` into the success `ProbeResult`. The S/MIME wire
+    transport has no notion of an AEAD cipher per se; `aead` remains
+    `None` for this probe.
+- `qwashed/audit/probe_pgp.py`:
+  - `PgpKeyInfo` gains `family: str = ""` populated for every
+    classified arm: `"rsa"` (algos 1/2/3), `"dsa"` (17),
+    `"elgamal"` (16), `"ec"` (18, 19, 22, 25, 26, 27, 28). Unknown
+    algorithm IDs leave the field empty so the boost router treats
+    them as fail-closed.
+  - `PgpProbe.probe(...)` threads
+    `public_key_bits=info.bit_length if info.bit_length else None`
+    and `public_key_algorithm_family=info.family or None` into the
+    success `ProbeResult`. PGP transport carries no AEAD-cipher
+    metadata; `aead` remains `None`.
+- `qwashed/audit/cli.py`:
+  - New `--explain` flag on `qwashed audit run`. After the JSON
+    report is written (and any HTML / PDF renders), prints
+    `explain_finding(finding, profile)` for every finding to
+    `stderr` so it does not contaminate the canonical JSON written
+    to `stdout` when `--output` is omitted.
+  - `from qwashed.audit.scoring import explain_finding` added to the
+    module imports.
+- `tests/audit/test_scoring.py` (+19 new tests across 3 classes):
+  - `TestV02Scoring` (16): no-data baseline preserves v0.1; RSA-1024
+    fires `+0.10`; RSA-2048 fires `+0.05`; RSA-3072 fires nothing;
+    DSA shares the RSA arm; ECC-160 fires `+0.05`; ECC-256 fires
+    nothing; cert lifetime past horizon fires `+0.05` (and inside
+    horizon fires nothing); `aead=False` fires `+0.05`; `aead=True`
+    fires nothing; full-stack (RSA-1024 + lifetime + non-AEAD) sums
+    to exactly `+0.20` (the cap); per-arm sanity check
+    `V02_BOOST_RSA_LT_MIN <= V02_MAX_PER_CONTRIBUTION`; final score
+    capped at `1.0` (journalism-classical-with-all-boosts case);
+    `key_length_thresholds` override (custom `rsa_minimum=4096` makes
+    a 3072-bit key fire `LT_MIN`); `cert_lifetime_horizon` override
+    (custom horizon `2026-01-01` makes a 2027 NotAfter fire);
+    `enable_v02_scoring=False` returns the v0.1 baseline.
+  - `TestV02PropertyEnvelope` (1, hypothesis): for any combination of
+    category × RSA bits × ECC bits × NotAfter × `aead` × family, the
+    observed boost sits in `[-residual, V02_MAX_TOTAL_BOOST]` (the
+    lower edge dips negative only when baseline + boost > 1 was
+    clamped down).
+  - `TestExplainFinding` (2): baseline-only output carries `target=`,
+    `category=`, `score=`, `severity=`; full-boost output names every
+    arm in its breakdown.
+- `tests/audit/test_golden.py`:
+  - `_DEFAULT_TLS_FIELDS` and `_HYBRID_TLS_FIELDS` extended with
+    `public_key_bits`, `public_key_algorithm_family`,
+    `cert_not_after`, `aead` so the canned probes exercise the v0.2
+    code paths. The chosen values represent a "well-configured but
+    classical" deployment (RSA-2048 / NotAfter inside horizon / AEAD
+    cipher) so the boost arms remain at zero — the wire-format diff
+    against v0.1 is a strict superset.
+  - `civic_default.json`, `healthcare_healthcare.json`,
+    `journalism_journalism.json`, `legal_legal.json` regenerated:
+    findings carry the four new probe fields; signatures regenerated
+    (deterministic-mode all-zero seed; bit-stable across runs).
+- `tests/audit/test_probe_smime.py`:
+  - `test_ecdsa_p256` updated: now asserts `info.public_key_bits ==
+    256` and `info.public_key_family == "ec"` (was `bits == 0` under
+    v0.1 because the field was reserved for RSA / DSA modulus only).
+    Documented in the test as the §3.5 widening of EC key reporting.
+
+### Verified
+
+- macOS Darwin arm64 / Python 3.13.2 with `[audit]` and `[vault]`
+  extras: `pytest` 543 passing + 1 skipped (the pre-existing
+  conditional sslyze-not-installed test). 245 of those passes are
+  in `tests/audit/`. New §3.5 surface: 19 scoring tests, 1 hypothesis
+  property test, 4 regenerated golden fixtures, 1 widened S/MIME
+  cert-info test.
+- v0.1 fixtures continue to round-trip: `tests/audit/test_scoring.py`
+  v0.1 cases (`TestSeverityFor`, `TestScoreFinding`, `TestAggregateScore`,
+  `TestAggregateSeverity`, `TestPropertyMonotonic`) are unchanged
+  and all pass — boosts are purely additive when probe data is
+  present and zero otherwise, preserving the v0.1 closed-form
+  `score = category_weight × archival_likelihood`.
+- Boost envelope: the property test sweeps the full boost-input
+  combinatorial space (4 categories × { RSA bits, ECC bits } × 5
+  NotAfter dates × {None, True, False} AEAD × 5 family values) and
+  asserts the observed boost is bounded by `V02_MAX_TOTAL_BOOST`.
+
+### Documentation
+
+- `docs/ROADMAP.md`: §3.5 marked `LANDED 2026-05-06` with a status
+  block summarizing the boost catalog, the per-arm + total caps, and
+  the `enable_v02_scoring` opt-out for v0.1-pinned profiles.
+  Sequencing list updated with §3.5 strikethrough.
+- `docs/AUDIT_GUIDE.md`: new "Reading the score (v0.2)" section
+  documenting the boost catalog, the `--explain` flag, the
+  `key_length_thresholds` / `cert_lifetime_horizon` /
+  `enable_v02_scoring` profile overrides, and the bounded-envelope
+  guarantee.
+
+#### Email PGP / S/MIME audit probe (ROADMAP §3.2) — 2026-05-06
+
+- `qwashed/audit/probe_pgp.py` (NEW): hand-rolled OpenPGP public-key
+  parser. Reads binary or ASCII-armored OpenPGP key blocks; walks
+  RFC 4880 §4.2 packet headers (old- and new-format, all three length
+  encodings) to find the primary public-key packet (tag 6); skips
+  subkeys (tag 14) and user-IDs. Classifies the primary's algorithm
+  ID (1=RSA / 17=DSA / 18=ECDH / 19=ECDSA / 22=EdDSA legacy /
+  25=X25519 / 26=X448 / 27=Ed25519 / 28=Ed448) and decodes the
+  algorithm-specific public-key body — RSA modulus bit length
+  bucketed to standard sizes, ECDH/ECDSA curve OID looked up against
+  the `_OID_TO_CURVE_NAME` table (NIST P-256/P-384/P-521,
+  brainpoolP256/384/512, Curve25519, Curve448). Returns an
+  `OpenPGPKeyInfo` dataclass; never raises on a malformed blob.
+  Hard cap `MAX_PGP_BYTES = 1 MiB`. **No** `gpg`/`pgpy`/`sequoia`
+  shell-out — preserves the no-network-no-subprocess invariant.
+- `qwashed/audit/probe_smime.py` (NEW): S/MIME (X.509) leaf-certificate
+  parser using `cryptography.x509` (already a Qwashed dep). Tries PEM
+  then DER. Classifies SubjectPublicKeyInfo via isinstance dispatch
+  against `RSAPublicKey` / `DSAPublicKey` / `EllipticCurvePublicKey`
+  / `Ed25519PublicKey` / `Ed448PublicKey` / `X25519PublicKey` /
+  `X448PublicKey`. Maps `signature_algorithm_oid.dotted_string` against
+  `_SIG_OID_TO_NAME` (PKCS#1 v1.5, RSASSA-PSS, ECDSA-SHA-2, EdDSA,
+  DSA-SHA-2). RSASSA-PSS hash refinement reads
+  `cert.signature_hash_algorithm` to produce `rsa_pss_sha{256,384,512}`.
+  Hard cap `MAX_SMIME_BYTES = 1 MiB`. Never raises on malformed input.
+  Out of scope (per §3.2 scope decision): chain validity, expiry,
+  revocation, OCSP, AIA chasing.
+- `qwashed/audit/probe_base.py` (NEW, internal): extracted `Probe` ABC
+  to break the circular import between TLS-handshake and file-only
+  probes.
+- `qwashed/audit/probe.py`:
+  - New `MultiplexProbe(probes: dict[str, Probe])`: routes per-protocol
+    based on `target.protocol`. Returns `status="malformed"` with a
+    typed `error_detail` if no probe is registered for the protocol.
+  - New `build_default_probe(*, tls_probe=None) -> MultiplexProbe`
+    factory: assembles a multiplex with `NativeTlsProbe` (or supplied
+    TLS probe) plus `PgpProbe` and `SmimeProbe` slots.
+  - `__all__` extended: `MultiplexProbe`, `PgpProbe`, `SmimeProbe`,
+    `build_default_probe`.
+- `qwashed/audit/schemas.py`:
+  - `ProtocolKind` literal extended with `"pgp"` and `"smime"`.
+  - New `FILE_ONLY_PROTOCOLS = frozenset({"pgp", "smime"})` constant.
+  - `AuditTarget` gains `key_path: str | None = None` field.
+  - New `_validate_protocol_fields` model validator: file-only protocols
+    require a non-empty `key_path`; non-file-only protocols reject
+    `key_path` outright. Both directions are fail-closed.
+- `qwashed/audit/algorithm_tables.json`: three new sections —
+  `pgp_public_key_algorithms`, `smime_public_key_algorithms`,
+  `smime_signature_algorithms` — covering RSA bucketed sizes,
+  Curve25519/448 (ECDH + EdDSA), NIST + brainpool ECDSA curves,
+  and the SHA-2 / SHA-1 (deprecated) RSA-PKCS#1 v1.5, RSA-PSS,
+  ECDSA, EdDSA, and DSA signature OIDs. All v0.2-known PQ
+  algorithm wire-names placeholdered as `pq_only` / `hybrid_pq`
+  for forward compatibility with the in-flight RFC 9580 hybrid
+  OpenPGP profile.
+- `qwashed/audit/classifier.py`:
+  - `AlgorithmTables` gains `_pgp_public_key`, `_smime_public_key`,
+    `_smime_signature` indexes plus `classify_pgp_public_key`,
+    `classify_smime_public_key`, `classify_smime_signature` methods.
+  - `classify_algorithm(...)` dispatch extended: protocol `"pgp"` /
+    field `"public_key"`, protocol `"smime"` / fields
+    `"public_key"` and `"signature"`.
+  - `classify(probe)` extended: PGP findings derive their category
+    from the primary key algorithm (probe's `signature_algorithm`
+    field, repurposed); S/MIME combines public-key category and
+    signature-algorithm category through the existing `_combine`
+    rule (any unknown ⇒ unknown; both classical ⇒ classical; one
+    PQ leg ⇒ hybrid_pq; all PQ ⇒ pq_only).
+- `qwashed/audit/roadmap.py`:
+  - `_ROADMAP_BASELINE` gains 8 entries: 4 PGP categories
+    (classical / hybrid_pq / pq_only / unknown) and 4 S/MIME
+    categories. Recommendations reference RFC 9580 hybrid OpenPGP
+    (Ed25519 + ML-DSA-65), CA roadmap awareness for hybrid
+    certificates, and chain-anchor caveats.
+  - `_ROADMAP_NON_OK["unreachable"]` updated: explicitly mentions
+    `key_path` for file-only PGP / S/MIME targets.
+  - `_ROADMAP_NON_OK["malformed"]` updated: covers truncated
+    OpenPGP packets, ASCII-armor with corrupted base64, PKCS#12
+    bundle confusion, and private-key files supplied where a
+    public key is expected.
+- `qwashed/audit/cli.py`:
+  - New `_resolve_key_path(raw_path, config_dir)` helper: relative
+    `key_path` resolves against the config YAML's directory so audit
+    bundles can ship `keys/` next to `email_pgp.yaml`. Absolute paths
+    and `~`-expanded paths bypass resolution. Existence is **not**
+    required at config-load time (file-only probes return
+    `status="unreachable"` if the file is missing).
+  - `_load_targets()` resolves `key_path` against
+    `config_path.parent.resolve()` before pydantic validation.
+  - `_probe_for_args()` rewritten to **always** return a
+    `MultiplexProbe` with `tls`/`pgp`/`smime` slots wired. The
+    `--probe {native,stdlib,sslyze}` selector now controls only
+    which TLS implementation occupies the `tls` slot.
+  - Module docstring updated with file-only YAML target example
+    showing `protocol: pgp` + `key_path:`.
+- `examples/audit/email_pgp.yaml` (NEW), `examples/audit/email_smime.yaml`
+  (NEW): runnable example configs demonstrating the file-only target
+  shape (host = key-owner email, port = 0, `key_path` relative to
+  the YAML's directory).
+- `tests/audit/test_probe_pgp.py` (NEW, 23 tests): hand-rolled
+  OpenPGP packet builders (`_new_format_packet`, `_v4_packet_header`,
+  `_mpi`, `_oid_prefixed`, `_ascii_armor`) so the test suite
+  exercises every algorithm path without depending on `gpg`/`pgpy`.
+  Coverage: RSA-1024/2048/4096, DSA-2048, Ed25519 native (algo 27),
+  EdDSA legacy curve25519 (algo 22 reported as `ed25519`),
+  ECDSA P-256, ECDH curve25519, unknown algo 99, ASCII-armor
+  round-trip, garbage / empty / truncated / oversize blobs,
+  primary-after-subkey discovery, wrong-protocol rejection.
+- `tests/audit/test_probe_smime.py` (NEW, 21 tests): in-memory
+  X.509 fixtures generated via `cryptography` (RSA-2048/3072,
+  ECDSA-P256/P384, Ed25519, DSA-2048, RSASSA-PSS SHA-256/384).
+  Both PEM and DER paths exercised. Coverage: ok / unreachable /
+  malformed / oversize / wrong-protocol / `key_path`-missing
+  (verified at the schema layer).
+- `tests/audit/test_classifier.py` (+8 tests): per-table
+  classification (`classify_pgp_public_key`,
+  `classify_smime_public_key`, `classify_smime_signature`) and
+  end-to-end `classify(probe)` for PGP / S/MIME findings,
+  including the asymmetric-leg cases.
+- `tests/audit/test_roadmap.py` (+9 tests, +1 fixed): 4 PGP +
+  4 S/MIME baseline coverage, file-target unreachable note,
+  and the existing `"not a valid TLS or SSH"` assertion updated
+  to the new `"not a valid TLS / SSH"` wording. Roadmap-table
+  completeness assertion expanded to all 16 (proto, category)
+  pairs.
+- `tests/golden/*.json` regenerated for the updated non-OK
+  status text in `roadmap.py`. Underlying findings are
+  byte-identical; only the non-OK advisory wording changed.
+
+### Verified
+
+- macOS Darwin arm64 / Python 3.13.2 with `[audit]` and `[vault]`
+  extras: `pytest` 523 passing + 1 skipped (the pre-existing
+  conditional sslyze-not-installed test). 225 of those passes are
+  in `tests/audit/`. New: 23 PGP probe tests, 21 SMIME probe tests,
+  8 classifier extensions, 9 roadmap extensions.
+- Public mirror (`/Users/mvm/Desktop/subvurs-public/qwashed/`) sync'd
+  via `rsync --delete` and re-tested: 225/audit pass, parity with
+  the source tree.
+- File-only target path resolution smoke-tested via
+  `_load_targets()` against both new example YAMLs:
+  `examples/audit/email_pgp.yaml` and
+  `examples/audit/email_smime.yaml` resolve relative `key_path`
+  against the YAML directory as designed.
+- Backward compatibility: pre-existing TLS / SSH probe codepaths
+  unchanged. The v0.1 golden audit fixtures were regenerated only
+  because the `roadmap.py` non-OK *advisory text* was extended to
+  mention file targets — no logical / scoring / classification
+  change. v0.1-shaped audit reports (TLS / SSH only) continue to
+  produce byte-identical signed JSON modulo this advisory-text
+  delta.
+
+### Documentation
+
+- `docs/ROADMAP.md`: §3.2 marked `LANDED 2026-05-06` with a
+  status block summarizing deviations from the original scope
+  (hand-rolled OpenPGP parser instead of `pgpy`; `MultiplexProbe`
+  routing; relative `key_path` resolution; keyring/WKD/HKP
+  discovery deferred to v0.3 as originally Risk-flagged).
+  Sequencing list (§4) updated with §3.2 strikethrough.
 
 #### Hand-rolled TLS probe / `NativeTlsProbe` (ROADMAP §3.4) — 2026-05-06
 

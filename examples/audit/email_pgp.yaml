@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Example audit config for OpenPGP keys (Qwashed v0.2 §3.2).
+#
+# File-only protocol: ``host`` is the key owner's email or display
+# label, ``port`` is set to 0 (ignored), and ``key_path`` points at a
+# binary or ASCII-armored public-key file. Relative paths are resolved
+# against this YAML's directory, so you can ship a config + keys/
+# folder together as a single audit bundle.
+targets:
+  - host: alice@example.org
+    port: 0
+    protocol: pgp
+    label: alice-primary
+    key_path: keys/alice.asc
+  - host: incoming-press@example.org
+    port: 0
+    protocol: pgp
+    label: press-tip-line
+    key_path: keys/press_tipline.gpg

@@ -19,7 +19,15 @@ def _finding(
     status: str = "ok",
     protocol: str = "tls",
 ) -> AuditFinding:
-    target = AuditTarget(host="x.example", port=443, protocol=protocol)  # type: ignore[arg-type]
+    if protocol in ("pgp", "smime"):
+        target = AuditTarget(  # type: ignore[arg-type]
+            host="alice@example.org",
+            port=0,
+            protocol=protocol,
+            key_path="/tmp/dummy.key",
+        )
+    else:
+        target = AuditTarget(host="x.example", port=443, protocol=protocol)  # type: ignore[arg-type]
     probe = ProbeResult(
         target=target,
         status=status,  # type: ignore[arg-type]
@@ -65,6 +73,47 @@ class TestBuildRoadmap:
         assert any("SSH" in s or "OpenSSH" in s for s in steps)
         assert any("sntrup761x25519" in s for s in steps)
 
+    def test_classical_pgp(self) -> None:
+        steps = build_roadmap(_finding(category="classical", severity="high", protocol="pgp"))
+        assert any("OpenPGP" in s for s in steps)
+        assert any("ML-DSA-65" in s for s in steps)
+
+    def test_hybrid_pgp(self) -> None:
+        steps = build_roadmap(_finding(category="hybrid_pq", severity="low", protocol="pgp"))
+        assert any("Hybrid PQ OpenPGP" in s for s in steps)
+
+    def test_pq_only_pgp(self) -> None:
+        steps = build_roadmap(_finding(category="pq_only", severity="info", protocol="pgp"))
+        assert any("Pure-PQ OpenPGP" in s for s in steps)
+
+    def test_unknown_pgp(self) -> None:
+        steps = build_roadmap(_finding(category="unknown", severity="moderate", protocol="pgp"))
+        assert any("could not classify the PGP" in s for s in steps)
+
+    def test_classical_smime(self) -> None:
+        steps = build_roadmap(_finding(category="classical", severity="high", protocol="smime"))
+        assert any("S/MIME" in s for s in steps)
+        assert any("ML-DSA-65" in s for s in steps)
+
+    def test_hybrid_smime(self) -> None:
+        steps = build_roadmap(_finding(category="hybrid_pq", severity="low", protocol="smime"))
+        assert any("Hybrid PQ S/MIME" in s for s in steps)
+
+    def test_pq_only_smime(self) -> None:
+        steps = build_roadmap(_finding(category="pq_only", severity="info", protocol="smime"))
+        assert any("Pure-PQ S/MIME" in s for s in steps)
+
+    def test_unknown_smime(self) -> None:
+        steps = build_roadmap(_finding(category="unknown", severity="moderate", protocol="smime"))
+        assert any("could not classify" in s for s in steps)
+
+    def test_unreachable_pgp_mentions_file(self) -> None:
+        steps = build_roadmap(
+            _finding(category="unknown", severity="moderate", status="unreachable", protocol="pgp")
+        )
+        # The non-OK note should mention key_path / file targets for file protocols.
+        assert any("key_path" in s for s in steps)
+
     def test_unreachable_includes_status_note(self) -> None:
         steps = build_roadmap(
             _finding(category="unknown", severity="moderate", status="unreachable")
@@ -73,7 +122,7 @@ class TestBuildRoadmap:
 
     def test_malformed_includes_status_note(self) -> None:
         steps = build_roadmap(_finding(category="unknown", severity="moderate", status="malformed"))
-        assert any("not a valid TLS or SSH" in s for s in steps)
+        assert any("not a valid TLS / SSH" in s for s in steps)
 
     def test_refused_includes_status_note(self) -> None:
         steps = build_roadmap(_finding(category="unknown", severity="low", status="refused"))
@@ -112,7 +161,10 @@ class TestRoadmapTable:
     def test_complete_coverage(self) -> None:
         # Every (protocol, category) combination must have a baseline.
         keys = {key for key, _ in ROADMAP_TABLE}
-        expected = {("tls", c) for c in ("classical", "hybrid_pq", "pq_only", "unknown")} | {
-            ("ssh", c) for c in ("classical", "hybrid_pq", "pq_only", "unknown")
-        }
+        expected = (
+            {("tls", c) for c in ("classical", "hybrid_pq", "pq_only", "unknown")}
+            | {("ssh", c) for c in ("classical", "hybrid_pq", "pq_only", "unknown")}
+            | {("pgp", c) for c in ("classical", "hybrid_pq", "pq_only", "unknown")}
+            | {("smime", c) for c in ("classical", "hybrid_pq", "pq_only", "unknown")}
+        )
         assert expected.issubset(keys)

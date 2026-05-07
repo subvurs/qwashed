@@ -667,10 +667,85 @@ def decrypt_tls13_record(
 
 @dataclasses.dataclass(frozen=True)
 class CertificateInfo:
-    """First (leaf) certificate from a Certificate handshake message."""
+    """First (leaf) certificate from a Certificate handshake message.
+
+    Attributes
+    ----------
+    leaf_der:
+        Raw DER-encoded leaf certificate.
+    leaf_signature_algorithm_oid:
+        Dotted-decimal OID of the certificate signature algorithm.
+    public_key_algorithm_family:
+        ``"rsa"``, ``"ec"``, ``"dsa"``, ``"ed25519"``, ``"ed448"``,
+        ``"x25519"``, ``"x448"``, or ``None`` if the public-key type is
+        not recognised. Used by the v0.2 scorer (§3.5).
+    public_key_bits:
+        RSA modulus or EC curve bit length. ``None`` for fixed-size
+        algorithms (Ed25519, Ed448, X25519, X448) and when the size
+        could not be determined.
+    not_after:
+        Leaf cert NotAfter as ISO 8601 ``YYYY-MM-DD`` (UTC).
+    """
 
     leaf_der: bytes
     leaf_signature_algorithm_oid: str  # dotted-decimal OID
+    public_key_algorithm_family: str | None = None
+    public_key_bits: int | None = None
+    not_after: str | None = None
+
+
+def _classify_x509_public_key(
+    cert: x509.Certificate,
+) -> tuple[str | None, int | None]:
+    """Return ``(family, bits)`` for ``cert``'s subject public key.
+
+    ``bits`` is the RSA modulus / DSA p length / EC curve bit size. For
+    fixed-size algorithms (Ed25519/Ed448/X25519/X448) ``bits`` is
+    ``None`` because the bit length is implied by the family.
+    """
+    # Imports are lazy so the cryptography submodule pulls in only what
+    # we actually need on this code path; same pattern as probe_smime.
+    from cryptography.hazmat.primitives.asymmetric import (
+        dsa,
+        ec,
+        ed448,
+        ed25519,
+        rsa,
+        x448 as _x448,
+        x25519 as _x25519,
+    )
+
+    pub = cert.public_key()
+    if isinstance(pub, rsa.RSAPublicKey):
+        return "rsa", pub.key_size
+    if isinstance(pub, dsa.DSAPublicKey):
+        return "dsa", pub.key_size
+    if isinstance(pub, ec.EllipticCurvePublicKey):
+        return "ec", pub.curve.key_size
+    if isinstance(pub, ed25519.Ed25519PublicKey):
+        return "ed25519", None
+    if isinstance(pub, ed448.Ed448PublicKey):
+        return "ed448", None
+    if isinstance(pub, _x25519.X25519PublicKey):
+        return "x25519", None
+    if isinstance(pub, _x448.X448PublicKey):
+        return "x448", None
+    return None, None
+
+
+def _cert_not_after_iso(cert: x509.Certificate) -> str | None:
+    """Return ``cert.not_valid_after_utc`` as ``YYYY-MM-DD`` or ``None``.
+
+    Uses the timezone-aware accessor introduced in cryptography>=42 and
+    falls back to the legacy naive accessor for older versions.
+    """
+    try:
+        not_after = cert.not_valid_after_utc  # cryptography >= 42
+    except AttributeError:  # pragma: no cover - legacy cryptography
+        not_after = cert.not_valid_after
+    if not_after is None:
+        return None
+    return not_after.strftime("%Y-%m-%d")
 
 
 def parse_certificate_message(hs_body: bytes, *, tls13: bool) -> CertificateInfo:
@@ -706,9 +781,13 @@ def parse_certificate_message(hs_body: bytes, *, tls13: bool) -> CertificateInfo
 
     cert = x509.load_der_x509_certificate(leaf_der)
     oid_dotted = cert.signature_algorithm_oid.dotted_string
+    family, bits = _classify_x509_public_key(cert)
     return CertificateInfo(
         leaf_der=leaf_der,
         leaf_signature_algorithm_oid=oid_dotted,
+        public_key_algorithm_family=family,
+        public_key_bits=bits,
+        not_after=_cert_not_after_iso(cert),
     )
 
 
